@@ -541,6 +541,30 @@ def parse_date_expression(date_text: str) -> tuple:
         now = datetime.now()
         return f"{date_str} {now.strftime('%H:%M:%S')}", 'date_only'
 
+    month_day_time_pattern = r'(\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2})'
+    match = re.search(month_day_time_pattern, text)
+    if match:
+        month_day_time_str = match.group(1)
+        parts = month_day_time_str.split()
+        month_day = parts[0].split('-')
+        time_parts = parts[1].split(':')
+        month = month_day[0].zfill(2)
+        day = month_day[1].zfill(2)
+        hour = time_parts[0].zfill(2)
+        minute = time_parts[1]
+        now = datetime.now()
+        return f"{now.year}-{month}-{day} {hour}:{minute}:00", 'month_day_time'
+
+    month_day_pattern = r'(\d{1,2}-\d{1,2})'
+    match = re.search(month_day_pattern, text)
+    if match:
+        month_day_str = match.group(1)
+        parts = month_day_str.split('-')
+        month = parts[0].zfill(2)
+        day = parts[1].zfill(2)
+        now = datetime.now()
+        return f"{now.year}-{month}-{day} {now.strftime('%H:%M:%S')}", 'month_day'
+
     cn_absolute_pattern = r'(\d{4})年(\d{1,2})月(\d{1,2})日'
     match = re.search(cn_absolute_pattern, text)
     if match:
@@ -905,6 +929,19 @@ def extract_date(locator_type: str, locator_value: str) -> str:
             return "错误：未找到日期元素"
 
         date_text = re.sub(r'\s+', ' ', date_text).strip()
+
+        date_patterns = [
+            r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+            r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
+            r'(\d{4}-\d{2}-\d{2})',
+        ]
+
+        for pattern in date_patterns:
+            match = re.search(pattern, date_text)
+            if match:
+                date_text = match.group(1)
+                break
+
         print(f"  [日期成功] 提取到日期文本: {date_text}")
 
         return date_text
@@ -1450,9 +1487,14 @@ class DeepSeekAgentWithTools:
         final_date_text = None
         final_date_locator = None
         last_validated_locator = None
+        date_agent_completed = False
 
         for step in range(10):
             print(f"  [日期Agent Step {step + 1}/10]")
+
+            if date_agent_completed:
+                print(f"  [日期Agent] 提取已完成，跳过")
+                break
 
             try:
                 response = self.llm_with_tools.invoke(messages)
@@ -1462,6 +1504,16 @@ class DeepSeekAgentWithTools:
                     for tool_call in response.tool_calls:
                         tool_name = tool_call["name"]
                         tool_args = tool_call["args"]
+
+                        if date_agent_completed:
+                            print(f"  [拦截] 日期提取已完成，跳过工具调用: {tool_name}")
+                            continue
+
+                        if check_duplicate_tool_call(tool_name, tool_args):
+                            print(f"  [拦截] 检测到重复工具调用: {tool_name}")
+                            continue
+
+                        record_tool_call(tool_name, tool_args)
 
                         print(f"    → 调用工具: {tool_name}")
 
@@ -1512,6 +1564,23 @@ class DeepSeekAgentWithTools:
                                             "locator_desc": "Agent保存",
                                             "create_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                                         }
+                                    if final_date_locator:
+                                        save_args = {
+                                            "locator_type": final_date_locator.get("locator_type"),
+                                            "locator_value": final_date_locator.get("locator_value"),
+                                            "locator_desc": final_date_locator.get("locator_desc", "")
+                                        }
+                                        save_func = None
+                                        for t in self.tools:
+                                            if t.name == "save_date_locator":
+                                                save_func = t
+                                                break
+                                        if save_func:
+                                            save_result = save_func.invoke(save_args)
+                                            print(f"    [日期定位器保存] {save_result}")
+                                    print(f"    [日期Agent完成] 成功提取日期并保存定位器")
+                                    date_agent_completed = True
+                                    continue
 
                             if tool_name == "save_date_locator":
                                 try:
@@ -1519,6 +1588,7 @@ class DeepSeekAgentWithTools:
                                     if result.get("success"):
                                         final_date_locator = result.get("locator")
                                         print(f"    [日期定位器保存成功]")
+                                        date_agent_completed = True
                                 except:
                                     pass
 
@@ -1528,13 +1598,25 @@ class DeepSeekAgentWithTools:
                         print(f"    [检测到完成信号]")
                         break
 
+                    completion_keywords = [
+                        "success", "完成", "成功", "已经完成", "提取成功",
+                        "日期已提取", "任务完成", "finished", "done"
+                    ]
+                    has_completion = any(keyword in content.lower() or keyword in content for keyword in completion_keywords)
+                    if has_completion:
+                        print(f"    [检测到完成关键词]")
+                        break
+
                     if step >= 9:
                         break
+
+                    messages.append(HumanMessage(content="请继续工作，使用工具完成任务。记住：定位表达式必须是通用型，找到一个能用的就停止！"))
 
             except Exception as e:
                 print(f"    [日期Agent错误] {e}")
                 if step >= 9:
                     break
+                messages.append(HumanMessage(content=f"发生错误: {e}，请继续尝试。"))
 
         return {
             "date_text": final_date_text,
