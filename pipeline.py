@@ -24,6 +24,49 @@ NEWS_PER_QUERY = 5
 USE_THREADED_PROCESSOR = False  # 是否使用多线程处理
 
 
+def select_search_source():
+    """交互式选择搜索引擎来源"""
+    print("\n请选择搜索引擎来源:")
+    print("  1. Brave 搜索引擎")
+    print("  2. Bing 国内版")
+    print("  3. Bing 国际版 (默认)")
+    
+    choice = input("\n请输入选择 (1/2/3，默认 3): ").strip()
+    
+    if choice == "1":
+        return "brave"
+    elif choice == "2":
+        return "bing"
+    else:
+        return "bing_en"
+
+
+def get_crawler(source: str):
+    """根据来源返回对应的爬虫函数"""
+    if source == "brave":
+        try:
+            from brave_crawler import crawl_news as brave_crawl
+            print(f"✅ 使用 Brave 搜索引擎")
+            return brave_crawl
+        except ImportError:
+            print("⚠️  找不到 brave_crawler.py，使用 Bing 国际版")
+            from bing_crawler_en import crawl_news as bing_crawl
+            return bing_crawl
+    elif source == "bing":
+        try:
+            from bing_crawler import crawl_news as bing_cn_crawl
+            print(f"✅ 使用 Bing 国内版搜索引擎")
+            return bing_cn_crawl
+        except ImportError:
+            print("⚠️  找不到 bing_crawler.py，使用 Bing 国际版")
+            from bing_crawler_en import crawl_news as bing_crawl
+            return bing_crawl
+    else:
+        from bing_crawler_en import crawl_news as bing_en_crawl
+        print(f"✅ 使用 Bing 国际版搜索引擎")
+        return bing_en_crawl
+
+
 def load_input_jsonl(file_path: str, from_end: bool = True, count: int = BATCH_SIZE):
     """加载输入JSONL文件"""
     items = []
@@ -51,16 +94,14 @@ def load_input_jsonl(file_path: str, from_end: bool = True, count: int = BATCH_S
         return []
 
 
-async def crawl_news_for_query(query: str, k: int = NEWS_PER_QUERY):
+async def crawl_news_for_query(crawl_func, query: str, k: int = NEWS_PER_QUERY):
     """爬取新闻"""
-    from brave_crawler import crawl_news as ths_crawl
-    
     print(f"\n{'='*60}")
     print(f"爬取关键词: {query[:50]}...")
     print(f"{'='*60}")
     
     try:
-        result = await ths_crawl(query, k)
+        result = await crawl_func(query, k)
         return result
     except Exception as e:
         print(f"爬取失败: {e}")
@@ -120,9 +161,14 @@ async def main():
     """主函数 - 流水线模式"""
     overall_start_time = datetime.now()
     
+    # 选择搜索引擎来源
+    source = select_search_source()
+    crawl_func = get_crawler(source)
+    
     print(f"\n{'#'*60}")
     print(f"# 新闻爬取与处理（流水线模式）")
     print(f"# 启动时间: {overall_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"# 搜索引擎: {source}")
     print(f"# 处理模式: {'多线程处理' if USE_THREADED_PROCESSOR else '串行处理'}")
     print(f"{'#'*60}\n")
     
@@ -130,6 +176,7 @@ async def main():
     print(f"  - 输入文件: {INPUT_JSONL_FILE}")
     print(f"  - 每次爬取新闻数: {NEWS_PER_QUERY}")
     print(f"  - 处理记录数: {BATCH_SIZE}")
+    print(f"  - 搜索引擎: {source}")
     print(f"  - 模式: 爬一条→处理一条（流水线）")
     print()
     
@@ -165,7 +212,7 @@ async def main():
         print(f"# [{idx}/{total_items}] 处理 id={item_id}")
         print(f"{'#'*60}")
         
-        news_list = await crawl_news_for_query(query, NEWS_PER_QUERY)
+        news_list = await crawl_news_for_query(crawl_func, query, NEWS_PER_QUERY)
         
         if not news_list:
             print(f"  未爬取到新闻，跳过")

@@ -512,14 +512,14 @@ def parse_date_expression(date_text: str) -> tuple:
     - YYYY-MM-DD hh:mm:ss - 完整格式，直接返回
     - YYYY-MM-DD hh:mm - 用00补全秒
     - YYYY-MM-DD - 只有日期，用当前时间的 hh:mm 补全
-    - 其他格式 - 尝试从文本中查找日期，失败则用当前日期时间
+    - 其他格式 - 尝试从文本中查找日期，失败则返回 (None, None)
 
     Returns:
-        (formatted_date_string, date_source)
+        (formatted_date_string, date_source) - 解析成功
+        (None, None) - 解析失败
     """
     if not date_text or not date_text.strip():
-        now = datetime.now()
-        return now.strftime('%Y-%m-%d %H:%M:%S'), 'current_time'
+        return None, None
 
     text = date_text.strip()
 
@@ -609,8 +609,7 @@ def parse_date_expression(date_text: str) -> tuple:
             now = datetime.now()
             return f"{year}-{month}-{day} {now.strftime('%H:%M:%S')}", 'en_absolute'
 
-    now = datetime.now()
-    return now.strftime('%Y-%m-%d %H:%M:%S'), 'current_time_fallback'
+    return None, None
 
 
 @tool
@@ -1507,10 +1506,22 @@ class DeepSeekAgentWithTools:
 
                         if date_agent_completed:
                             print(f"  [拦截] 日期提取已完成，跳过工具调用: {tool_name}")
+                            # 即使被拦截，也要添加 ToolMessage，避免 API 错误
+                            tool_result = json.dumps({"success": False, "error": "日期提取已完成，跳过调用"}, ensure_ascii=False)
+                            messages.append(ToolMessage(
+                                content=str(tool_result),
+                                tool_call_id=tool_call["id"]
+                            ))
                             continue
 
                         if check_duplicate_tool_call(tool_name, tool_args):
                             print(f"  [拦截] 检测到重复工具调用: {tool_name}")
+                            # 即使被拦截，也要添加 ToolMessage，避免 API 错误
+                            tool_result = json.dumps({"success": False, "error": "重复调用，已跳过"}, ensure_ascii=False)
+                            messages.append(ToolMessage(
+                                content=str(tool_result),
+                                tool_call_id=tool_call["id"]
+                            ))
                             continue
 
                         record_tool_call(tool_name, tool_args)
@@ -1564,23 +1575,13 @@ class DeepSeekAgentWithTools:
                                             "locator_desc": "Agent保存",
                                             "create_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                                         }
-                                    if final_date_locator:
-                                        save_args = {
-                                            "locator_type": final_date_locator.get("locator_type"),
-                                            "locator_value": final_date_locator.get("locator_value"),
-                                            "locator_desc": final_date_locator.get("locator_desc", "")
-                                        }
-                                        save_func = None
-                                        for t in self.tools:
-                                            if t.name == "save_date_locator":
-                                                save_func = t
-                                                break
-                                        if save_func:
-                                            save_result = save_func.invoke(save_args)
-                                            print(f"    [日期定位器保存] {save_result}")
-                                    print(f"    [日期Agent完成] 成功提取日期并保存定位器")
+                                    print(f"    [日期Agent完成] 成功提取日期，准备返回")
                                     date_agent_completed = True
-                                    continue
+                                    # 直接返回结果，不再继续
+                                    return {
+                                        "date_text": final_date_text,
+                                        "date_locator": final_date_locator
+                                    }
 
                             if tool_name == "save_date_locator":
                                 try:
@@ -1717,28 +1718,35 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
             print(f"[纯脚本] 正文提取成功，但无日期定位器，尝试 Agent 获取日期...")
             need_date_agent = True
         elif final_content and date_locators:
-            for idx, locator in enumerate(date_locators, 1):
-                locator_type = locator.get('locator_type', '')
-                locator_value = locator.get('locator_value', '')
-                print(f"[纯脚本日期 {idx}/{len(date_locators)}] 使用 {locator_type}={locator_value} 提取日期")
+                for idx, locator in enumerate(date_locators, 1):
+                    locator_type = locator.get('locator_type', '')
+                    locator_value = locator.get('locator_value', '')
+                    print(f"[纯脚本日期 {idx}/{len(date_locators)}] 使用 {locator_type}={locator_value} 提取日期")
 
-                date_text = browser_manager.extractor.extract_text_by_selector(
-                    html_content, locator_type, locator_value
-                )
+                    date_text = browser_manager.extractor.extract_text_by_selector(
+                        html_content, locator_type, locator_value
+                    )
 
-                if date_text and date_text.strip():
-                    date_text = re.sub(r'\s+', ' ', date_text).strip()
-                    print(f"[纯脚本日期] 提取到原始文本: {date_text}")
-                    parsed_date, parsed_source = parse_date_expression(date_text)
-                    if parsed_date:
-                        final_date = parsed_date
-                        date_source = 'content'
-                        print(f"[纯脚本日期成功] 解析后日期: {final_date} (来源: {date_source})")
-                        break
+                    if date_text and date_text.strip():
+                        date_text = re.sub(r'\s+', ' ', date_text).strip()
+                        print(f"[纯脚本日期] 提取到原始文本: {date_text}")
+                        parsed_date, parsed_source = parse_date_expression(date_text)
+                        if parsed_date:
+                            final_date = parsed_date
+                            date_source = 'content'
+                            _current_news_info['_date_extract_success'] = True
+                            _current_news_info['_date_raw_text'] = date_text
+                            print(f"[纯脚本日期成功] 解析后日期: {final_date} (来源: {date_source})")
+                            break
+                        else:
+                            print(f"[纯脚本日期解析失败] 无法解析日期文本: {date_text}")
+                            _current_news_info['_date_extract_success'] = False
+                            _current_news_info['_date_parse_fail'] = True
+                            _current_news_info['_date_raw_text'] = date_text
                     else:
-                        print(f"[纯脚本日期解析失败] 无法解析日期文本: {date_text}")
-                else:
-                    print(f"[纯脚本日期 {idx}/{len(date_locators)}] 未提取到文本")
+                        print(f"[纯脚本日期 {idx}/{len(date_locators)}] 未提取到文本")
+                        _current_news_info['_date_extract_success'] = False
+                        _current_news_info['_date_no_text'] = True
 
         if final_content:
             result_item = {**news_item, 'content': final_content, '_id': news_id, 'status': 'success', 'used_pure_script': True, 'used_agent': False, 'used_date_agent': False}
@@ -1755,10 +1763,13 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
                 date_locator = date_result.get("date_locator")
 
                 if date_text:
+                    result_item['_date_agent_raw_text'] = date_text
                     parsed_date, date_source = parse_date_expression(date_text)
                     if parsed_date:
                         final_date = parsed_date
                         date_source = 'content'
+                        result_item['_date_agent_success'] = True
+                        result_item['_date_agent_parse_success'] = True
                         print(f"[Agent日期成功] 解析后日期: {final_date} (来源: {date_source})")
                         result_item['parsed_date'] = final_date
                         result_item['date_source'] = date_source
@@ -1774,27 +1785,37 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
                             print(f"[新增] 域名 {final_domain} 添加日期定位规则: {date_locator.get('locator_value', '')}")
                     else:
                         print(f"[Agent日期失败] 无法解析日期文本: {date_text}")
+                        result_item['_date_agent_success'] = True
+                        result_item['_date_agent_parse_fail'] = True
+                        result_item['_date_fallback'] = True
                         brave_date = news_item.get('parsed_date')
                         if brave_date:
                             result_item['parsed_date'] = brave_date
                             result_item['date_source'] = news_item.get('date_source', 'brave')
+                            result_item['_date_fallback_type'] = 'brave'
                             print(f"[日期] 回退到 Brave 日期: {brave_date}")
                         else:
                             now = datetime.now()
                             result_item['parsed_date'] = now.strftime('%Y-%m-%d %H:%M:%S')
                             result_item['date_source'] = 'current_time'
+                            result_item['_date_fallback_type'] = 'current'
                             print(f"[日期] 无可用日期，使用当前时间: {result_item['parsed_date']}")
                 else:
                     print(f"[Agent日期失败] Agent 未能提取日期")
+                    result_item['_date_agent_success'] = False
+                    result_item['_date_agent_no_text'] = True
+                    result_item['_date_fallback'] = True
                     brave_date = news_item.get('parsed_date')
                     if brave_date:
                         result_item['parsed_date'] = brave_date
                         result_item['date_source'] = news_item.get('date_source', 'brave')
+                        result_item['_date_fallback_type'] = 'brave'
                         print(f"[日期] 回退到 Brave 日期: {brave_date}")
                     else:
                         now = datetime.now()
                         result_item['parsed_date'] = now.strftime('%Y-%m-%d %H:%M:%S')
                         result_item['date_source'] = 'current_time'
+                        result_item['_date_fallback_type'] = 'current'
                         print(f"[日期] 无可用日期，使用当前时间: {result_item['parsed_date']}")
             else:
                 brave_date = news_item.get('parsed_date')
@@ -1985,6 +2006,15 @@ def process_jsonl_file(jsonl_file: str):
     date_from_content_count = 0
     date_from_brave_count = 0
     date_from_current_count = 0
+    # 新增详细统计
+    date_pure_script_success = 0          # 纯脚本日期提取成功
+    date_pure_script_parse_fail = 0       # 纯脚本日期提取成功但解析失败
+    date_pure_script_no_text = 0          # 纯脚本日期没有提取到文本
+    date_agent_extract_success = 0        # Agent提取到日期文本
+    date_agent_parse_fail = 0             # Agent提取到文本但解析失败
+    date_agent_no_text = 0                # Agent没有提取到文本
+    date_fallback_brave = 0               # 回退到Brave日期
+    date_fallback_current = 0             # 回退到当前时间
     news_results = []
     
     try:
@@ -2009,13 +2039,73 @@ def process_jsonl_file(jsonl_file: str):
                     if result_item.get('used_pure_script'):
                         pure_script_count += 1
 
+                    # 详细的日期统计
                     date_source = result_item.get('date_source', '')
-                    if date_source == 'content':
-                        date_from_content_count += 1
-                    elif date_source == 'brave':
-                        date_from_brave_count += 1
-                    elif date_source == 'current_time' or date_source == 'current_time_fallback':
-                        date_from_current_count += 1
+                    if result_item.get('used_date_agent'):
+                        # Agent日期统计
+                        date_agent_count += 1
+                        if result_item.get('_date_agent_success'):
+                            # Agent成功提取到文本
+                            date_agent_extract_success += 1
+                            if result_item.get('_date_agent_parse_success'):
+                                # 解析成功
+                                date_from_content_count += 1
+                                date_agent_success_count += 1
+                            else:
+                                # 解析失败
+                                date_agent_parse_fail += 1
+                                if result_item.get('_date_fallback_type') == 'brave':
+                                    date_fallback_brave += 1
+                                    date_from_brave_count += 1
+                                elif result_item.get('_date_fallback_type') == 'current':
+                                    date_fallback_current += 1
+                                    date_from_current_count += 1
+                        else:
+                            # Agent没有提取到文本
+                            date_agent_no_text += 1
+                            if result_item.get('_date_fallback_type') == 'brave':
+                                date_fallback_brave += 1
+                                date_from_brave_count += 1
+                            elif result_item.get('_date_fallback_type') == 'current':
+                                date_fallback_current += 1
+                                date_from_current_count += 1
+                    elif result_item.get('used_pure_script') and not result_item.get('used_date_agent'):
+                        # 纯脚本日期统计
+                        if result_item.get('_date_extract_success'):
+                            date_pure_script_success += 1
+                            date_from_content_count += 1
+                        elif result_item.get('_date_parse_fail'):
+                            date_pure_script_parse_fail += 1
+                            if date_source == 'brave':
+                                date_fallback_brave += 1
+                                date_from_brave_count += 1
+                            elif date_source == 'current_time':
+                                date_fallback_current += 1
+                                date_from_current_count += 1
+                        elif result_item.get('_date_no_text'):
+                            date_pure_script_no_text += 1
+                            if date_source == 'brave':
+                                date_fallback_brave += 1
+                                date_from_brave_count += 1
+                            elif date_source == 'current_time':
+                                date_fallback_current += 1
+                                date_from_current_count += 1
+                        else:
+                            # 其他情况
+                            if date_source == 'content':
+                                date_from_content_count += 1
+                            elif date_source == 'brave':
+                                date_from_brave_count += 1
+                            elif date_source == 'current_time':
+                                date_from_current_count += 1
+                    else:
+                        # 其他情况
+                        if date_source == 'content':
+                            date_from_content_count += 1
+                        elif date_source == 'brave':
+                            date_from_brave_count += 1
+                        elif date_source == 'current_time':
+                            date_from_current_count += 1
 
                 elif result_item.get('status') == 'blacklisted':
                     blacklisted_count += 1
@@ -2026,11 +2116,6 @@ def process_jsonl_file(jsonl_file: str):
                         agent_success_count += 1
                     else:
                         agent_failed_count += 1
-
-                if result_item.get('used_date_agent'):
-                    date_agent_count += 1
-                    if date_source == 'content':
-                        date_agent_success_count += 1
                     
             except Exception as e:
                 print(f"处理第{item_num}条新闻失败: {e}")
@@ -2069,12 +2154,24 @@ def process_jsonl_file(jsonl_file: str):
     print(f"  完成所需时间: {elapsed_seconds:.1f}秒")
     print(f"{'='*60}")
     print(f"  日期统计:")
-    print(f"    日期Agent调用次数: {date_agent_count}")
-    print(f"    日期Agent成功次数: {date_agent_success_count}")
-    print(f"    日期Agent成功率: {date_agent_success_count/date_agent_count*100:.1f}%" if date_agent_count > 0 else "    日期Agent成功率: 0%")
-    print(f"    日期来源-正文: {date_from_content_count}")
-    print(f"    日期来源-Brave: {date_from_brave_count}")
-    print(f"    日期来源-当前时间: {date_from_current_count}")
+    print(f"    日期来源统计:")
+    print(f"      - 正文: {date_from_content_count}")
+    print(f"      - Brave: {date_from_brave_count}")
+    print(f"      - 当前时间: {date_from_current_count}")
+    print(f"    日期Agent统计:")
+    print(f"      - 调用次数: {date_agent_count}")
+    print(f"      - 提取成功: {date_agent_extract_success}")
+    print(f"      - 解析成功: {date_agent_success_count}")
+    print(f"      - 解析失败: {date_agent_parse_fail}")
+    print(f"      - 无文本: {date_agent_no_text}")
+    print(f"      - 成功率: {date_agent_success_count/date_agent_count*100:.1f}%" if date_agent_count > 0 else "      - 成功率: 0%")
+    print(f"    纯脚本日期统计:")
+    print(f"      - 提取成功: {date_pure_script_success}")
+    print(f"      - 解析失败: {date_pure_script_parse_fail}")
+    print(f"      - 无文本: {date_pure_script_no_text}")
+    print(f"    回退统计:")
+    print(f"      - 回退Brave: {date_fallback_brave}")
+    print(f"      - 回退当前时间: {date_fallback_current}")
     print(f"{'='*60}")
 
     stats = {
@@ -2093,12 +2190,19 @@ def process_jsonl_file(jsonl_file: str):
         "success_rate": success_count / total_items * 100 if total_items > 0 else 0,
         "agent_rate": agent_count / total_items * 100 if total_items > 0 else 0,
         "date_stats": {
-            "date_agent_count": date_agent_count,
-            "date_agent_success_count": date_agent_success_count,
-            "date_agent_success_rate": date_agent_success_count / date_agent_count * 100 if date_agent_count > 0 else 0,
             "date_from_content": date_from_content_count,
             "date_from_brave": date_from_brave_count,
-            "date_from_current_time": date_from_current_count
+            "date_from_current_time": date_from_current_count,
+            "date_agent_count": date_agent_count,
+            "date_agent_extract_success": date_agent_extract_success,
+            "date_agent_parse_success": date_agent_success_count,
+            "date_agent_parse_fail": date_agent_parse_fail,
+            "date_agent_no_text": date_agent_no_text,
+            "date_pure_script_success": date_pure_script_success,
+            "date_pure_script_parse_fail": date_pure_script_parse_fail,
+            "date_pure_script_no_text": date_pure_script_no_text,
+            "date_fallback_brave": date_fallback_brave,
+            "date_fallback_current": date_fallback_current
         }
     }
     

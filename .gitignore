@@ -1,32 +1,11 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+# Data files
+*.jsonl
+*.db
+*.sqlite
+*.sqlite3
 
-# Virtual Environment
-venv/
-env/
-.venv/
-ENV/
-env.bak/
-venv.bak/
+# Screenshots
+screenshots/
 
 # IDE
 .vscode/
@@ -34,71 +13,21 @@ venv.bak/
 *.swp
 *.swo
 *~
-.DS_Store
-.project
-.pydevproject
-.settings/
-
-# API Keys and Secrets (不要提交到仓库！)
-*.key
-*.pem
-.env
-.env.local
-api_key*
-secret*
-
-# Data Files (运行产生的数据)
-*.jsonl
-!example.jsonl
-news.jsonl
-crawled_news.jsonl
-results.jsonl
-results_threaded.jsonl
-
-# Database (WAL mode files)
-*.db
-*.db-shm
-*.db-wal
-
-# Error and Stats
-error.json
-error_threaded.json
-test_error.json
-processor_stats.json
-
-# Memory Cache
-memory.json
-!memory.json.example
-
-# Screenshots
-screenshots/
-*.png
-*.jpg
-*.jpeg
-
-# Browser Profiles
-ChromeProfile/
-EdgeProfile/
-*.crx
 
 # Logs
 *.log
-logs/
 
-# Temporary files
-*.tmp
-*.bak
-*.cache
-tmp/
-temp/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Crowdtangle data (if used)
-ct_data/
+# Environment
+.env
+.env.local
 
-# Jupyter Notebook
-.ipynb_checkpoints/
-
-# OS specific
-Thumbs.db
-.DS_Store
-*.desktop
+# Build
+dist/
+build/
+*.egg-info/
