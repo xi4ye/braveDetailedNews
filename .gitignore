@@ -31,3 +31,12 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Temporary files
+.trae/
+ChromeProfile/
+captcha_debug/
+bing_news.png
+error*.json
+memory.json
+processor_stats.json
