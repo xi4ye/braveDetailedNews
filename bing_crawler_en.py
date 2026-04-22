@@ -107,17 +107,48 @@ async def crawl_news(news,K=20):
     """
     options = ChromiumOptions()
 
-    # options.add_argument('--headless')  # 无头模式
+    # 英文 Windows User-Agent
+    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
+    
+    # 语言和地区设置（英文）
+    options.add_argument('--accept-lang=en-US,en;q=0.9,zh;q=0.8')
+    
+    # 反检测设置
+    options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument('--no-sandbox')  # 禁止沙箱模式
     options.add_argument('--remote-allow-origins=*') 
     options.add_argument('--disable-dev-shm-usage')  # 解决资源受限
+    options.add_argument('--disable-infobars')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--window-size=1920,1080')
     options.add_argument('--headless=new') 
     # options.add_argument('--proxy-server=85.12.6.87:500')  # 设置代理服务器
     async with Edge(options=options) as browser:
 
         page =  await browser.start()
 
-        await page.go_to(f'https://www.bing.com/search?q={news}&ensearch=1')
+        # 加载并注入完整的 stealth.min.js 反检测脚本
+        import os
+        stealth_js_path = os.path.join(os.path.dirname(__file__), 'stealth.min.js')
+        if os.path.exists(stealth_js_path):
+            with open(stealth_js_path, 'r', encoding='utf-8') as f:
+                stealth_script = f.read()
+            await page.execute_script(stealth_script)
+            print("[info] 已注入完整的 stealth.min.js 反检测脚本")
+        else:
+            print("[warning] 未找到 stealth.min.js，使用简化版本")
+            # 简化备用方案
+            await page.execute_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'zh'] });
+            """)
+
+        # 用英文引号包裹搜索词，并进行 URL 编码，添加地区参数
+        quoted_news = f'"{news}"'
+        encoded_news = urllib.parse.quote(quoted_news)
+        await page.go_to(f'https://www.bing.com/search?q={encoded_news}&ensearch=1&cc=US&setlang=en-US')
         
         await asyncio.sleep(8)  # 等待页面加载
         i = 0

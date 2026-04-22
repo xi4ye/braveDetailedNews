@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import os
+import urllib.parse
 from pydoll.browser import Edge
 from pydoll.constants import By
 from pydoll.browser.options import ChromiumOptions
@@ -161,6 +162,9 @@ async def crawl_news(news,K=20):
     # 自定义 User-Agent
     custom_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     options.add_argument(f'--user-agent={custom_ua}')
+    
+    # 语言和地区设置
+    options.add_argument('--accept-lang=zh-CN,zh;q=0.9,en;q=0.8')
 
     # WebRTC 泄漏防护
     options.webrtc_leak_protection = True
@@ -173,12 +177,34 @@ async def crawl_news(news,K=20):
 
     async with Edge(options=options) as browser:
         page = await browser.start()
+        
+        # 加载并注入完整的 stealth.min.js 反检测脚本
+        import os
+        stealth_js_path = os.path.join(os.path.dirname(__file__), 'stealth.min.js')
+        if os.path.exists(stealth_js_path):
+            with open(stealth_js_path, 'r', encoding='utf-8') as f:
+                stealth_script = f.read()
+            await page.execute_script(stealth_script)
+            print("[info] 已注入完整的 stealth.min.js 反检测脚本")
+        else:
+            print("[warning] 未找到 stealth.min.js，使用简化版本")
+            # 简化备用方案
+            await page.execute_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            """)
+        
         i = 0
         j = 0
         result = []
 
         while i < K:
-            search_url = f'https://search.brave.com/search?q={news}&source=web&offset={j}'
+            # 用英文引号包裹搜索词，并进行 URL 编码
+            quoted_news = f'"{news}"'
+            encoded_news = urllib.parse.quote(quoted_news)
+            search_url = f'https://search.brave.com/search?q={encoded_news}&source=web&offset={j}'
             await page.go_to(search_url)
 
             await asyncio.sleep(3)
