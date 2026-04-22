@@ -40,15 +40,21 @@ def select_search_source():
     """交互式选择搜索引擎来源"""
     print("\n请选择搜索引擎来源:")
     print("  1. Brave 搜索引擎")
-    print("  2. Bing 国内版")
-    print("  3. Bing 国际版 (默认)")
+    print("  2. Bing 国内版 (浏览器版)")
+    print("  3. Bing 国内版 (HTTP版)")
+    print("  4. Bing 国际版 (浏览器版，默认)")
+    print("  5. Bing 国际版 (HTTP版)")
     
-    choice = input("\n请输入选择 (1/2/3，默认 3): ").strip()
+    choice = input("\n请输入选择 (1/2/3/4/5，默认 4): ").strip()
     
     if choice == "1":
         return "brave"
     elif choice == "2":
         return "bing"
+    elif choice == "3":
+        return "bing_http"
+    elif choice == "5":
+        return "bing_en_http"
     else:
         return "bing_en"
 
@@ -67,15 +73,33 @@ def get_crawler(source: str):
     elif source == "bing":
         try:
             from bing_crawler import crawl_news as bing_cn_crawl
-            print(f"✅ 使用 Bing 国内版搜索引擎")
+            print(f"✅ 使用 Bing 国内版搜索引擎（浏览器版）")
             return bing_cn_crawl
         except ImportError:
             print("⚠️  找不到 bing_crawler.py，使用 Bing 国际版")
             from bing_crawler_en import crawl_news as bing_crawl
             return bing_crawl
+    elif source == "bing_http":
+        try:
+            from bing_http_crawler import crawl_news as bing_http_crawl
+            print(f"✅ 使用 Bing 国内版搜索引擎（HTTP版）")
+            return bing_http_crawl
+        except ImportError:
+            print("⚠️  找不到 bing_http_crawler.py，使用 Bing 国内版浏览器版")
+            from bing_crawler import crawl_news as bing_cn_crawl
+            return bing_cn_crawl
+    elif source == "bing_en_http":
+        try:
+            from bing_http_crawler import crawl_news_en as bing_en_http_crawl
+            print(f"✅ 使用 Bing 国际版搜索引擎（HTTP版）")
+            return bing_en_http_crawl
+        except ImportError:
+            print("⚠️  找不到 bing_http_crawler.py，使用 Bing 国际版浏览器版")
+            from bing_crawler_en import crawl_news as bing_en_crawl
+            return bing_en_crawl
     else:
         from bing_crawler_en import crawl_news as bing_en_crawl
-        print(f"✅ 使用 Bing 国际版搜索引擎")
+        print(f"✅ 使用 Bing 国际版搜索引擎（浏览器版）")
         return bing_en_crawl
 
 
@@ -115,9 +139,11 @@ async def main():
         print("用法: python main.py \"新闻描述\" K [来源] [--proxy 代理地址]")
         print()
         print("来源可选:")
-        print("  - brave  (Brave 搜索引擎)")
-        print("  - bing   (Bing 国内版)")
-        print("  - bing_en (Bing 国际版，默认)")
+        print("  - brave        (Brave 搜索引擎)")
+        print("  - bing         (Bing 国内版，浏览器版)")
+        print("  - bing_http    (Bing 国内版，HTTP版)")
+        print("  - bing_en      (Bing 国际版，浏览器版，默认)")
+        print("  - bing_en_http (Bing 国际版，HTTP版)")
         print()
         print("代理说明:")
         print("  Bing 国际版从中国IP会被重定向到cn.bing.com，建议使用海外代理")
@@ -125,8 +151,8 @@ async def main():
         print()
         print("示例:")
         print('  python main.py "特朗普关税提高到80%" 10')
-        print('  python main.py "特朗普关税提高到80%" 10 bing')
-        print('  python main.py "polar ice core" 5 bing_en --proxy http://127.0.0.1:7890')
+        print('  python main.py "特朗普关税提高到80%" 10 bing_http')
+        print('  python main.py "polar ice core" 5 bing_en_http --proxy http://127.0.0.1:7890')
         sys.exit(1)
 
     news_description = sys.argv[1]
@@ -142,7 +168,7 @@ async def main():
     # 从命令行参数获取来源
     source_arg = None
     for arg in sys.argv[3:]:
-        if arg.lower() in ["brave", "bing", "bing_en"]:
+        if arg.lower() in ["brave", "bing", "bing_http", "bing_en", "bing_en_http"]:
             source_arg = arg.lower()
             break
     
@@ -174,7 +200,12 @@ async def main():
     print(f"# 阶段 1：爬取新闻")
     print(f"{'='*60}\n")
 
-    news_list = await crawl_func(news_description, K, proxy=proxy)
+    # 判断是否是异步函数
+    import inspect
+    if inspect.iscoroutinefunction(crawl_func):
+        news_list = await crawl_func(news_description, K, proxy=proxy)
+    else:
+        news_list = crawl_func(news_description, K, proxy=proxy)
 
     if not news_list:
         print("没有爬取到任何新闻，结束")
