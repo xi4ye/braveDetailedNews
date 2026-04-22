@@ -5,6 +5,7 @@ import urllib.parse
 from pydoll.browser import Edge
 from pydoll.constants import By
 from pydoll.browser.options import ChromiumOptions
+from pydoll.commands import PageCommands
 from datetime import datetime, timedelta
 import re
 from pydoll.elements.mixins.find_elements_mixin import FindElementsMixin
@@ -133,12 +134,13 @@ def extract_and_convert_date(text):
     # 无匹配结果
     return None, None
 
-async def crawl_news(news,K=20):
+async def crawl_news(news,K=20, proxy=None):
     """
     使用 Pydoll 库的 edge 浏览器爬取新闻
     不会打开浏览器界面
     K为需要爬取的新闻数量
     news为新闻标题
+    proxy为代理服务器地址，默认 127.0.0.1:7890
     pip install pydoll-python
     """
     options = ChromiumOptions()
@@ -169,8 +171,12 @@ async def crawl_news(news,K=20):
     # WebRTC 泄漏防护
     options.webrtc_leak_protection = True
 
-    # 代理 (如果不需要可以注释掉)
-    options.add_argument('--proxy-server=127.0.0.1:7890')
+    # 代理设置（默认 127.0.0.1:7890）
+    if proxy is None:
+        proxy = "127.0.0.1:7890"
+    if proxy:
+        options.add_argument(f'--proxy-server={proxy}')
+        print(f"[info] 使用代理: {proxy}")
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     screenshot_prefix = f"{SCREENSHOT_DIR}/{timestamp}"
@@ -178,23 +184,31 @@ async def crawl_news(news,K=20):
     async with Edge(options=options) as browser:
         page = await browser.start()
         
-        # 加载并注入完整的 stealth.min.js 反检测脚本
-        import os
+        # 加载 stealth.min.js 并使用 CDP 持久化注入（跨导航生效）
         stealth_js_path = os.path.join(os.path.dirname(__file__), 'stealth.min.js')
         if os.path.exists(stealth_js_path):
             with open(stealth_js_path, 'r', encoding='utf-8') as f:
                 stealth_script = f.read()
-            await page.execute_script(stealth_script)
-            print("[info] 已注入完整的 stealth.min.js 反检测脚本")
+            await page._execute_command(
+                PageCommands.add_script_to_evaluate_on_new_document(
+                    source=stealth_script,
+                    run_immediately=True,
+                )
+            )
+            print("[info] 已持久化注入 stealth.min.js（跨导航生效）")
         else:
             print("[warning] 未找到 stealth.min.js，使用简化版本")
-            # 简化备用方案
-            await page.execute_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-            """)
+            await page._execute_command(
+                PageCommands.add_script_to_evaluate_on_new_document(
+                    source="""
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        window.chrome = { runtime: {} };
+                        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                    """,
+                    run_immediately=True,
+                )
+            )
         
         i = 0
         j = 0

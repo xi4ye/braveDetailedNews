@@ -8,17 +8,22 @@ main.py - 命令行版本的新闻爬取与处理程序
 - main.py: 直接接受命令行参数（新闻描述 + 爬取数量）
 
 用法：
-    python main.py "新闻描述" K [来源]
+    python main.py "新闻描述" K [来源] [--proxy 代理地址]
 
 来源可选：
     - brave  (Brave 搜索引擎)
     - bing   (Bing 国内版)
     - bing_en (Bing 国际版，默认)
 
+代理说明：
+    Bing 国际版从中国IP访问会被强制重定向到cn.bing.com，导致搜索结果不相关。
+    建议使用海外代理，例如: --proxy http://127.0.0.1:7890
+
 示例：
     python main.py "特朗普关税提高到80%" 10
     python main.py "特朗普关税提高到80%" 10 bing
     python main.py "polar ice core" 5 bing_en
+    python main.py "polar ice core" 5 bing_en --proxy http://127.0.0.1:7890
 """
 
 import asyncio
@@ -107,28 +112,42 @@ def save_news_to_jsonl(news_list: list, output_file: str = "crawled_news.jsonl")
 async def main():
     """主函数"""
     if len(sys.argv) < 3:
-        print("用法: python main.py \"新闻描述\" K [来源]")
+        print("用法: python main.py \"新闻描述\" K [来源] [--proxy 代理地址]")
         print()
         print("来源可选:")
         print("  - brave  (Brave 搜索引擎)")
         print("  - bing   (Bing 国内版)")
         print("  - bing_en (Bing 国际版，默认)")
         print()
+        print("代理说明:")
+        print("  Bing 国际版从中国IP会被重定向到cn.bing.com，建议使用海外代理")
+        print("  示例: --proxy http://127.0.0.1:7890")
+        print()
         print("示例:")
         print('  python main.py "特朗普关税提高到80%" 10')
         print('  python main.py "特朗普关税提高到80%" 10 bing')
-        print('  python main.py "polar ice core" 5 bing_en')
+        print('  python main.py "polar ice core" 5 bing_en --proxy http://127.0.0.1:7890')
         sys.exit(1)
 
     news_description = sys.argv[1]
     K = int(sys.argv[2]) if len(sys.argv) > 2 else 5
     
-    # 从命令行参数获取来源，如果没有则交互式选择
-    if len(sys.argv) >= 4:
-        source = sys.argv[3].lower()
-        if source not in ["brave", "bing", "bing_en"]:
-            print(f"⚠️  无效的来源 '{source}'，使用交互式选择")
-            source = select_search_source()
+    # 解析代理参数（默认 127.0.0.1:7890）
+    proxy = "127.0.0.1:7890"
+    if '--proxy' in sys.argv:
+        proxy_idx = sys.argv.index('--proxy')
+        if proxy_idx + 1 < len(sys.argv):
+            proxy = sys.argv[proxy_idx + 1]
+    
+    # 从命令行参数获取来源
+    source_arg = None
+    for arg in sys.argv[3:]:
+        if arg.lower() in ["brave", "bing", "bing_en"]:
+            source_arg = arg.lower()
+            break
+    
+    if source_arg:
+        source = source_arg
     else:
         source = select_search_source()
 
@@ -146,6 +165,7 @@ async def main():
     print(f"  - 搜索描述: {news_description}")
     print(f"  - 爬取数量: {K}")
     print(f"  - 搜索引擎: {source}")
+    print(f"  - 代理: {proxy}")
     print()
 
     start_time = datetime.now()
@@ -154,7 +174,7 @@ async def main():
     print(f"# 阶段 1：爬取新闻")
     print(f"{'='*60}\n")
 
-    news_list = await crawl_func(news_description, K)
+    news_list = await crawl_func(news_description, K, proxy=proxy)
 
     if not news_list:
         print("没有爬取到任何新闻，结束")

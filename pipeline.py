@@ -41,7 +41,7 @@ def select_search_source():
         return "bing_en"
 
 
-def get_crawler(source: str):
+def get_crawler(source: str, proxy: str = None):
     """根据来源返回对应的爬虫函数"""
     if source == "brave":
         try:
@@ -64,6 +64,7 @@ def get_crawler(source: str):
     else:
         from bing_crawler_en import crawl_news as bing_en_crawl
         print(f"✅ 使用 Bing 国际版搜索引擎")
+        print(f"✅ 使用代理: {proxy}")
         return bing_en_crawl
 
 
@@ -94,14 +95,17 @@ def load_input_jsonl(file_path: str, from_end: bool = True, count: int = BATCH_S
         return []
 
 
-async def crawl_news_for_query(crawl_func, query: str, k: int = NEWS_PER_QUERY):
+async def crawl_news_for_query(crawl_func, query: str, k: int = NEWS_PER_QUERY, proxy: str = None):
     """爬取新闻"""
     print(f"\n{'='*60}")
     print(f"爬取关键词: {query[:50]}...")
     print(f"{'='*60}")
     
     try:
-        result = await crawl_func(query, k)
+        if proxy:
+            result = await crawl_func(query, k, proxy=proxy)
+        else:
+            result = await crawl_func(query, k)
         return result
     except Exception as e:
         print(f"爬取失败: {e}")
@@ -163,7 +167,14 @@ async def main():
     
     # 选择搜索引擎来源
     source = select_search_source()
-    crawl_func = get_crawler(source)
+    
+    # 代理设置（默认 127.0.0.1:7890）
+    proxy = "127.0.0.1:7890"
+    proxy_input = input(f"请输入代理地址（默认 {proxy}，直接回车使用默认）: ").strip()
+    if proxy_input:
+        proxy = proxy_input
+    
+    crawl_func = get_crawler(source, proxy=proxy)
     
     print(f"\n{'#'*60}")
     print(f"# 新闻爬取与处理（流水线模式）")
@@ -212,7 +223,7 @@ async def main():
         print(f"# [{idx}/{total_items}] 处理 id={item_id}")
         print(f"{'#'*60}")
         
-        news_list = await crawl_news_for_query(crawl_func, query, NEWS_PER_QUERY)
+        news_list = await crawl_news_for_query(crawl_func, query, NEWS_PER_QUERY, proxy=proxy)
         
         if not news_list:
             print(f"  未爬取到新闻，跳过")
