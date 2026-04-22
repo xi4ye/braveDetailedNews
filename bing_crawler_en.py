@@ -8,7 +8,7 @@ import os
 from pydoll.browser import Edge
 from pydoll.constants import By
 from pydoll.browser.options import ChromiumOptions
-from pydoll.commands import PageCommands
+from pydoll.commands import PageCommands, NetworkCommands
 from datetime import datetime, timedelta
 import re
 
@@ -31,6 +31,7 @@ def extract_real_url(bing_url):
     except Exception:
         pass
     return bing_url  # 解析失败返回原 URL
+
 
 def get_english_date(gap):
     """
@@ -136,7 +137,7 @@ async def crawl_news(news,K=20, proxy=None):
 
         page =  await browser.start()
 
-        # 加载 stealth.min.js 并使用 CDP 持久化注入（跨导航生效）
+        # 加载并注入完整的 stealth.min.js 反检测脚本
         stealth_js_path = os.path.join(os.path.dirname(__file__), 'stealth.min.js')
         if os.path.exists(stealth_js_path):
             with open(stealth_js_path, 'r', encoding='utf-8') as f:
@@ -161,37 +162,97 @@ async def crawl_news(news,K=20, proxy=None):
                     run_immediately=True,
                 )
             )
-
-        # 先访问 Bing NCR 设置 cookie，防止 IP 重定向
-        await page.go_to('https://www.bing.com/ncr')
-        await asyncio.sleep(2)
         
-        # 调试输出当前 URL
-        current_url = await page.execute_script('window.location.href')
-        print(f"[debug] NCR 后的 URL: {current_url}")
-        
-        # 尝试点击「est_en」或英文版本按钮（原来代码有注释的代码）
-        try:
-            intnet = await page.find_or_wait_element(By.ID, "est_en", timeout=5)
-            await intnet.click()
-            await asyncio.sleep(2)
-            current_url = await page.execute_script('window.location.href')
-            print(f"[debug] 点击 est_en 后的 URL: {current_url}")
-        except:
-            print("[debug] 未找到 est_en 按钮")
+        # 注入页面级脚本，拦截 window.location 赋值（防止客户端重定向）
+        await page._execute_command(
+            PageCommands.add_script_to_evaluate_on_new_document(
+                source="""
+                // 拦截 location.href 和 location.assign 重定向
+                (function() {
+                    const originalHrefDescriptor = Object.getOwnPropertyDescriptor(
+                        window.location.__proto__ || window.location,
+                        'href'
+                    );
+                    const originalAssign = window.location.assign.bind(window.location);
+                    const originalReplace = window.location.replace.bind(window.location);
+                    
+                    const forbiddenHosts = ['cn.bing.com'];
+                    function isForbiddenUrl(url) {
+                        return forbiddenHosts.some(host => url.includes(host));
+                    }
+                    
+                    // 覆盖 href 赋值
+                    if (originalHrefDescriptor && originalHrefDescriptor.set) {
+                        Object.defineProperty(window.location, 'href', {
+                            get: originalHrefDescriptor.get,
+                            set: function(newUrl) {
+                                if (!isForbiddenUrl(newUrl)) {
+                                    originalHrefDescriptor.set.call(this, newUrl);
+                                } else {
+                                    console.log('拦截到禁止的 URL:', newUrl);
+                                }
+                            },
+                            configurable: true
+                        });
+                    }
+                    
+                    // 覆盖 assign 方法
+                    window.location.assign = function(newUrl) {
+                        if (!isForbiddenUrl(newUrl)) {
+                            originalAssign(newUrl);
+                        } else {
+                            console.log('拦截到禁止的 assign:', newUrl);
+                        }
+                    };
+                    
+                    // 覆盖 replace 方法
+                    window.location.replace = function(newUrl) {
+                        if (!isForbiddenUrl(newUrl)) {
+                            originalReplace(newUrl);
+                        } else {
+                            console.log('拦截到禁止的 replace:', newUrl);
+                        }
+                    };
+                    
+                    // 覆盖 meta refresh
+                    const observer = new MutationObserver(function(mutations) {
+                        mutations.forEach(function(mutation) {
+                            mutation.addedNodes.forEach(function(node) {
+                                if (node.tagName === 'META' && 
+                                    (node.httpEquiv?.toLowerCase() === 'refresh' ||
+                                     node.getAttribute?.('http-equiv')?.toLowerCase() === 'refresh')) {
+                                    node.remove();
+                                }
+                            });
+                        });
+                    });
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                })();
+            """,
+                run_immediately=True,
+            )
+        )
+        print("[info] 重定向拦截脚本已注入")
 
-        # 检测是否是中文关键词
+        # 注意：不访问 /ncr，那会设置重定向 cookie
+        # 中文关键词也要用国际版（因为你有海外代理）
         has_chinese = any('\u4e00' <= c <= '\u9fff' for c in news)
         if has_chinese:
-            print("[warn] 检测到中文关键词，建议使用 Bing 国内版 (bing) 而不是 Bing 国际版 (bing_en)")
-            # 中文关键词：不使用引号，直接在 cn.bing.com 上搜索
+            print("[info] 检测到中文关键词，将用 Bing 国际版搜索")
             encoded_news = urllib.parse.quote(news)
-            search_url = f'https://cn.bing.com/search?q={encoded_news}'
         else:
-            # 英文关键词：使用引号
             quoted_news = f'"{news}"'
             encoded_news = urllib.parse.quote(quoted_news)
-            search_url = f'https://www.bing.com/search?q={encoded_news}&ensearch=1&cc=US&setlang=en-US'
+        
+        # 构建完整的搜索 URL，强制使用国际版
+        search_url = (
+            f'https://www.bing.com/search?q={encoded_news}'
+            '&ensearch=1'
+            '&cc=US'
+            '&setlang=en-US'
+            '&mkt=en-US'
+            '&safeSearch=Off'
+        )
         print(f"[debug] 最终搜索 URL: {search_url}")
         await page.go_to(search_url)
         
