@@ -156,28 +156,38 @@ def _parse_search_results(soup, base_url, K):
     return result, next_url
 
 
-def crawl_news_http(news, K=20, proxy=None, international=False):
+def crawl_news_http(news, K=20, proxy=None, international=False, exact_match=False):
     if proxy is None:
         proxy = "127.0.0.1:7890"
     
     if proxy:
         print(f"[info] 使用代理: {proxy}")
     
+    if exact_match:
+        print("[info] 使用精确匹配模式（关键词用双引号括起）")
+        quoted_news = f'"{news}"'
+        encoded_news = urllib.parse.quote(quoted_news)
+    else:
+        encoded_news = urllib.parse.quote(news)
+    
     session = _build_session(proxy)
     
-    if international:
-        base_url = "https://www.bing.com"
-        encoded_news = urllib.parse.quote(news)
-        search_url = (
-            f"{base_url}/search?q={encoded_news}"
-            "&ensearch=1&cc=US&setlang=en-US&mkt=en-US&safeSearch=Off"
-        )
-        print("[info] 使用 Bing 国际版搜索 (HTTP)")
+    # 关键方案：所有搜索都使用 cn.bing.com
+    # - 对于英文关键词使用 &ensearch=1
+    # - 对于中文关键词直接搜索
+    base_url = "https://cn.bing.com"
+    
+    # 检查是否是英文关键词
+    has_chinese = any('\u4e00' <= c <= '\u9fff' for c in news)
+    
+    if international or not has_chinese:
+        # 英文关键词或国际版模式，使用 &ensearch=1
+        search_url = f"{base_url}/search?q={encoded_news}&ensearch=1"
+        print("[info] 使用 cn.bing.com + &ensearch=1 (优化英文搜索)")
     else:
-        base_url = "https://cn.bing.com"
-        encoded_news = urllib.parse.quote(news)
+        # 中文关键词，直接搜索
         search_url = f"{base_url}/search?q={encoded_news}"
-        print("[info] 使用 Bing 国内版搜索 (HTTP)")
+        print("[info] 使用 cn.bing.com 直接搜索 (中文关键词)")
     
     print(f"[debug] 搜索 URL: {search_url}")
     
@@ -196,11 +206,6 @@ def crawl_news_http(news, K=20, proxy=None, international=False):
             
             final_url = response.url
             print(f"[debug] 状态码: {response.status_code}, 最终URL: {final_url}")
-            
-            # 检测是否被重定向到 cn.bing.com（国际版场景）
-            if international and 'cn.bing.com' in final_url:
-                print("[warn] 被 302 重定向到 cn.bing.com，搜索结果可能不相关")
-                print("[warn] 请确认代理是海外代理（美国/欧洲 IP）")
             
             soup = BeautifulSoup(response.text, 'html.parser')
             page_results, next_url = _parse_search_results(soup, base_url, K - len(result))
@@ -227,12 +232,12 @@ def crawl_news_http(news, K=20, proxy=None, international=False):
     return result
 
 
-def crawl_news(news, K=20, proxy=None):
-    return crawl_news_http(news, K, proxy, international=False)
+def crawl_news(news, K=20, proxy=None, exact_match=False):
+    return crawl_news_http(news, K, proxy, international=False, exact_match=exact_match)
 
 
-def crawl_news_en(news, K=20, proxy=None):
-    return crawl_news_http(news, K, proxy, international=True)
+def crawl_news_en(news, K=20, proxy=None, exact_match=False):
+    return crawl_news_http(news, K, proxy, international=True, exact_match=exact_match)
 
 
 if __name__ == "__main__":

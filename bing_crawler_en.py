@@ -100,7 +100,7 @@ def parse_english_date(date_str):
     
     return None
         
-async def crawl_news(news,K=20, proxy=None):
+async def crawl_news(news,K=20, proxy=None, exact_match=False):
     """
     使用 Pydoll 库的 edge 浏览器爬取新闻
     不会打开浏览器界面
@@ -108,6 +108,7 @@ async def crawl_news(news,K=20, proxy=None):
     news为新闻标题
     proxy为代理服务器地址，默认 127.0.0.1:7890（国际版必须使用海外代理）
     pip install pydoll-python
+    exact_match: 是否使用精确匹配（将关键词用双引号括起来）
     """
     options = ChromiumOptions()
 
@@ -239,10 +240,13 @@ async def crawl_news(news,K=20, proxy=None):
         has_chinese = any('\u4e00' <= c <= '\u9fff' for c in news)
         if has_chinese:
             print("[info] 检测到中文关键词，将用 Bing 国际版搜索")
-            encoded_news = urllib.parse.quote(news)
-        else:
+        
+        if exact_match:
+            print("[info] 使用精确匹配模式（关键词用双引号括起）")
             quoted_news = f'"{news}"'
             encoded_news = urllib.parse.quote(quoted_news)
+        else:
+            encoded_news = urllib.parse.quote(news)
         
         # 构建完整的搜索 URL，强制使用国际版
         search_url = (
@@ -262,7 +266,11 @@ async def crawl_news(news,K=20, proxy=None):
         final_url = await page.execute_script('window.location.href')
         print(f"[debug] 最终页面 URL: {final_url}")
         
-        i = 0
+        i = 0 
+        search = await page.find_or_wait_element(By.ID, "b_icon_spyglass",timeout=15)
+        await search.click()
+        await asyncio.sleep(10)
+        
         result = []
         await page.take_screenshot("bing_news.png")
         while i < K:
@@ -319,7 +327,7 @@ if __name__ == "__main__":
     # ==============================
     # Bing 国际版 (EN) - 测试入口
     # ==============================
-    news = "polar ice core drilling breaks international record"
+    news = "Iran has closed the Strait of Hormuz"
     K = 5
     # query_date = "2025-07-30"
     asyncio.run(crawl_news(news, K))
