@@ -165,18 +165,44 @@ async def crawl_news(news,K=20, proxy=None):
         # 先访问 Bing NCR 设置 cookie，防止 IP 重定向
         await page.go_to('https://www.bing.com/ncr')
         await asyncio.sleep(2)
+        
+        # 调试输出当前 URL
+        current_url = await page.execute_script('window.location.href')
+        print(f"[debug] NCR 后的 URL: {current_url}")
+        
+        # 尝试点击「est_en」或英文版本按钮（原来代码有注释的代码）
+        try:
+            intnet = await page.find_or_wait_element(By.ID, "est_en", timeout=5)
+            await intnet.click()
+            await asyncio.sleep(2)
+            current_url = await page.execute_script('window.location.href')
+            print(f"[debug] 点击 est_en 后的 URL: {current_url}")
+        except:
+            print("[debug] 未找到 est_en 按钮")
 
-        # 用英文引号包裹搜索词，并进行 URL 编码
-        quoted_news = f'"{news}"'
-        encoded_news = urllib.parse.quote(quoted_news)
-        await page.go_to(f'https://www.bing.com/search?q={encoded_news}&ensearch=1')
+        # 检测是否是中文关键词
+        has_chinese = any('\u4e00' <= c <= '\u9fff' for c in news)
+        if has_chinese:
+            print("[warn] 检测到中文关键词，建议使用 Bing 国内版 (bing) 而不是 Bing 国际版 (bing_en)")
+            # 中文关键词：不使用引号，直接在 cn.bing.com 上搜索
+            encoded_news = urllib.parse.quote(news)
+            search_url = f'https://cn.bing.com/search?q={encoded_news}'
+        else:
+            # 英文关键词：使用引号
+            quoted_news = f'"{news}"'
+            encoded_news = urllib.parse.quote(quoted_news)
+            search_url = f'https://www.bing.com/search?q={encoded_news}&ensearch=1&cc=US&setlang=en-US'
+        print(f"[debug] 最终搜索 URL: {search_url}")
+        await page.go_to(search_url)
         
         await asyncio.sleep(8)  # 等待页面加载
+        
+        # 再次调试输出最终 URL
+        final_url = await page.execute_script('window.location.href')
+        print(f"[debug] 最终页面 URL: {final_url}")
+        
         i = 0
         result = []
-        # intnet = await page.find_or_wait_element(By.ID, "est_en",timeout=15)
-        # await page.take_screenshot("bing_news.png")
-        # await intnet.click()
         await page.take_screenshot("bing_news.png")
         while i < K:
             news_items = await page.find_or_wait_element(By.CLASS_NAME, "b_algo",find_all=True,timeout=15)
@@ -214,11 +240,17 @@ async def crawl_news(news,K=20, proxy=None):
                     "description": abstract_text,
                     "source": "Bing"
                 })
-            btn = await page.find_or_wait_element(By.CLASS_NAME, "sb_pagN")
-            await btn.click()
             
-
-            await asyncio.sleep(8)  # 等待页面加载          
+            # 点击下一页（如果存在）
+            if i < K:
+                try:
+                    btn = await page.find_or_wait_element(By.CLASS_NAME, "sb_pagN", timeout=3)
+                    await btn.click()
+                    await asyncio.sleep(8)  # 等待页面加载
+                except:
+                    print("[info] 没有更多结果了")
+                    break
+                
         await browser.stop()
         print(result)
         return result

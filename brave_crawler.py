@@ -215,9 +215,8 @@ async def crawl_news(news,K=20, proxy=None):
         result = []
 
         while i < K:
-            # 用英文引号包裹搜索词，并进行 URL 编码
-            quoted_news = f'"{news}"'
-            encoded_news = urllib.parse.quote(quoted_news)
+            # 不用引号包裹搜索词
+            encoded_news = urllib.parse.quote(news)
             search_url = f'https://search.brave.com/search?q={encoded_news}&source=web&offset={j}'
             await page.go_to(search_url)
 

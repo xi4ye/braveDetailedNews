@@ -162,10 +162,8 @@ async def crawl_news(news,K=20, proxy=None):
                 )
             )
 
-        # 用英文引号包裹搜索词，并进行 URL 编码
-        # 注意: cn.bing.com 搜索质量较差，引号可能降低匹配度
-        quoted_news = f'"{news}"'
-        encoded_news = urllib.parse.quote(quoted_news)
+        # 不用引号包裹搜索词（cn.bing.com 用引号反而匹配更差）
+        encoded_news = urllib.parse.quote(news)
         await page.go_to(f'https://cn.bing.com/search?q={encoded_news}')
         
         await asyncio.sleep(8)  # 等待页面加载
@@ -211,11 +209,17 @@ async def crawl_news(news,K=20, proxy=None):
                     "description": abstract_text,
                     "source": "Bing"
                 })
-            btn = await page.find_or_wait_element(By.CLASS_NAME, "sb_pagN")
-            await btn.click()
             
-
-            await asyncio.sleep(8)  # 等待页面加载          
+            # 点击下一页（如果存在）
+            if i < K:
+                try:
+                    btn = await page.find_or_wait_element(By.CLASS_NAME, "sb_pagN", timeout=3)
+                    await btn.click()
+                    await asyncio.sleep(8)  # 等待页面加载
+                except:
+                    print("[info] 没有更多结果了")
+                    break
+                
         await browser.stop()
         print(result)
         return result
