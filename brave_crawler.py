@@ -234,28 +234,29 @@ async def crawl_news(news,K=20, proxy=None):
                 await asyncio.sleep(2)
                 waited += 2
 
-                # 检查是否有搜索结果
+                has_news = False
                 try:
-                    test_elem = await page.find_element(By.CLASS_NAME, "result-wrapper")
+                    test_elem = await page.find_or_wait_element(By.CLASS_NAME, "result-wrapper")
                     if test_elem:
-                        found = True
-                        print(f"[页面 {j}] ✅ 找到搜索结果！")
-                        break
+                        has_news = True
                 except:
                     pass
 
-                try:
-                    test_elem = await page.find_element(By.CLASS_NAME, "search-snippet-title")
-                    if test_elem:
-                        found = True
-                        print(f"[页面 {j}] ✅ 找到搜索结果！")
-                        break
-                except:
-                    pass
+                if not has_news:
+                    try:
+                        test_elem = await page.find_or_wait_element(By.CLASS_NAME, "search-snippet-title")
+                        if test_elem:
+                            has_news = True
+                    except:
+                        pass
 
-                # 检查是否有验证码
+                if has_news:
+                    found = True
+                    print(f"[页面 {j}] ✅ 找到搜索结果！跳过验证码检测。")
+                    break
+
                 try:
-                    turnstile_elem = await page.find_element(By.CSS_SELECTOR, 'iframe[title*="captcha"], iframe[title*="challenge"]')
+                    turnstile_elem = await page.find_or_wait_element(By.CSS_SELECTOR, 'iframe[title*="captcha"], iframe[title*="challenge"]')
                     if turnstile_elem and not captcha_clicked:
                         print(f"[页面 {j}] 发现验证码，尝试点击...")
                         try:
@@ -268,7 +269,7 @@ async def crawl_news(news,K=20, proxy=None):
                             ]
                             for selector in selectors:
                                 try:
-                                    elem = await page.find_element(By.CSS_SELECTOR, selector)
+                                    elem = await page.find_or_wait_element(By.CSS_SELECTOR, selector)
                                     if elem:
                                         await elem.click()
                                         print(f"[页面 {j}] ✅ 验证码点击成功: {selector}")
@@ -287,7 +288,6 @@ async def crawl_news(news,K=20, proxy=None):
                 except:
                     pass
 
-                # 如果等待超过30秒且还没有找到结果，尝试调用验证码解决器
                 if waited >= 30 and not found and not captcha_solver_tried:
                     print(f"[页面 {j}] 等待超时，尝试调用验证码解决器...")
                     try:
@@ -372,10 +372,10 @@ async def crawl_news(news,K=20, proxy=None):
                 pass
 
         await browser.stop()
-        print(f"[完成] 爬取完成，共获取 {len(result)} 条新闻")
+        print(result)
         return result
 if __name__ == "__main__":
-    news = "近日，特朗普声称将与中国的关税提高到80%"
+    news = "polar ice core drilling breaks international record"
     K = 5
     # query_date = "2025-07-30"
     asyncio.run(crawl_news(news, K))

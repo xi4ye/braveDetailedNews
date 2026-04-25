@@ -95,28 +95,40 @@ def calculate_gap_distance(captcha_image_path):
     log_debug(f"[距离计算] 滑块位置: ({x_slider},{y_slider}) 尺寸: {w_slider}x{h_slider}")
     log_debug(f"[距离计算] 滑块中心: ({center_slider_x},{center_slider_y})")
     
+    slider_radius = (w_slider + h_slider) // 4
+    log_debug(f"[距离计算] 滑块等效半径: {slider_radius}")
+    
     # ==========================================
-    # 第三步：只关注图片的右半部分 + 中轴线附近
+    # 第三步：搜索区域 = 滑块右边缘+10px 到图片最右边
     # ==========================================
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    right_region_start = int(w * 0.3)
+    slider_right_edge = x_slider + w_slider
+    right_region_start = slider_right_edge + 10
     
-    # 只取中轴线附近的一个窄条（上下各30像素）
-    search_y_start = max(0, mid_y - 30)
-    search_y_end = min(h, mid_y + 30)
+    search_margin = slider_radius
+    search_y_start = max(0, mid_y - search_margin)
+    search_y_end = min(h, mid_y + search_margin)
     
     gray_search = gray[search_y_start:search_y_end, right_region_start:]
     h_search, w_search = gray_search.shape
     
-    log_debug(f"[距离计算] 搜索区域: 右x={right_region_start}, Y范围=[{search_y_start}, {search_y_end}]")
+    log_debug(f"[距离计算] 搜索区域: X=[{right_region_start}, {w}], Y=[{search_y_start}, {search_y_end}]")
+    log_debug(f"[距离计算] 搜索区域尺寸: {w - right_region_start}x{search_y_end - search_y_start}px")
     
     # ==========================================
     # 第四步：模糊处理！让模糊的圆更明显
     # ==========================================
+    blur_scale = slider_radius / 50.0
+    k1 = max(3, int(15 * blur_scale) | 1)
+    k2 = max(3, int(11 * blur_scale) | 1)
+    k3 = max(3, int(9 * blur_scale) | 1)
+    
     blurred = gray_search.copy()
-    blurred = cv2.GaussianBlur(blurred, (15, 15), 0)
-    blurred = cv2.medianBlur(blurred, 11)
-    blurred = cv2.GaussianBlur(blurred, (9, 9), 0)
+    blurred = cv2.GaussianBlur(blurred, (k1, k1), 0)
+    blurred = cv2.medianBlur(blurred, k2)
+    blurred = cv2.GaussianBlur(blurred, (k3, k3), 0)
+    
+    log_debug(f"[距离计算] 模糊核大小: ({k1},{k1}) + ({k2},{k2}) + ({k3},{k3}) (基于滑块半径 {slider_radius})")
     
     # ==========================================
     # 第五步：在中轴线上找圆形！
@@ -124,22 +136,24 @@ def calculate_gap_distance(captcha_image_path):
     best_circle = None
     best_score = 0
     
-    # 尝试更宽松的多种参数
     param2_values = [25, 20, 15, 12, 10, 8]
-    min_radius = 15
-    max_radius = 60
+    min_radius = max(10, int(slider_radius * 0.6))
+    max_radius = min(int(w * 0.3), int(slider_radius * 1.4))
     dp_values = [1.1, 1.2, 1.3, 1.5]
     
-    found = False
+    min_dist = int(slider_radius * 0.6)
+    
+    log_debug(f"[距离计算] 缺口半径搜索范围: [{min_radius}, {max_radius}]")
+    
+    all_candidates = []
+    
     for dp in dp_values:
-        if found:
-            break
         for param2 in param2_values:
             circles = cv2.HoughCircles(
                 blurred,
                 cv2.HOUGH_GRADIENT,
                 dp=dp,
-                minDist=30,
+                minDist=min_dist,
                 param1=40,
                 param2=param2,
                 minRadius=min_radius,
@@ -149,41 +163,57 @@ def calculate_gap_distance(captcha_image_path):
             if circles is not None:
                 circles = np.uint16(np.around(circles))
                 
-                # 选择圆心最接近中轴线上的那个！
                 for circle in circles[0]:
-                    cx_rel, cy_rel, r = circle
+                    cx_rel, cy_rel, r = int(circle[0]), int(circle[1]), int(circle[2])
+                    abs_x = cx_rel + right_region_start
                     
-                    # 计算这个圆在搜索区域中的相对位置距离中轴线有多远
-                    # 防止整数溢出
                     mid_search = h_search // 2
-                    if cy_rel > mid_search:
-                        dist_from_mid = cy_rel - mid_search
+                    dist_from_mid = abs(cy_rel - mid_search)
+                    mid_score = max(0.0, 1.0 - (dist_from_mid / slider_radius))
+                    
+                    radius_diff = abs(r - slider_radius)
+                    radius_score = max(0.0, 1.0 - (radius_diff / (slider_radius * 0.4)))
+                    
+                    mask = np.zeros(gray_search.shape, dtype=np.uint8)
+                    cv2.circle(mask, (cx_rel, cy_rel), r, 255, -1)
+                    circle_gray = gray_search[mask == 255]
+                    
+                    outside_mask = np.zeros(gray_search.shape, dtype=np.uint8)
+                    cv2.circle(outside_mask, (cx_rel, cy_rel), r + int(slider_radius * 0.2), 255, -1)
+                    cv2.circle(outside_mask, (cx_rel, cy_rel), r, 0, -1)
+                    outside_gray = gray_search[outside_mask == 255]
+                    
+                    if len(circle_gray) > 0 and len(outside_gray) > 0:
+                        contrast = abs(np.mean(circle_gray) - np.mean(outside_gray))
+                        contrast_score = min(1.0, contrast / (slider_radius * 0.6))
                     else:
-                        dist_from_mid = mid_search - cy_rel
+                        contrast_score = 0.0
                     
-                    # 评分：距离中轴线越近，分数越高！
-                    score = max(0.0, 1.0 - (dist_from_mid / 30.0))
+                    combined_score = mid_score * 0.4 + radius_score * 0.3 + contrast_score * 0.3
                     
-                    if score > best_score:
-                        best_score = score
-                        best_circle = circle
-                
-                if best_circle is not None:
-                    found = True
-                    break
+                    key = (abs_x, r)
+                    if key not in [(c[0], c[1]) for c in all_candidates]:
+                        all_candidates.append((abs_x, r, mid_score, radius_score, contrast_score, combined_score))
     
-    if best_circle is None:
+    if not all_candidates:
         raise ValueError("在中轴线上找不到缺口圆！")
+    
+    all_candidates.sort(key=lambda x: -x[5])
+    best = all_candidates[0]
+    center_gap_x = best[0]
+    
+    log_debug(f"[距离计算] 检测到 {len(all_candidates)} 个候选圆")
+    log_debug(f"[距离计算] 最佳候选: X={center_gap_x}, 半径={best[1]}")
+    log_debug(f"[距离计算] 评分: 中轴={best[2]:.2f}, 半径={best[3]:.2f}, 对比度={best[4]:.2f}, 综合={best[5]:.2f}")
     
     # ==========================================
     # 第六步：计算圆心位置（绝对坐标）
     # ==========================================
-    circle_x_rel, circle_y_rel, circle_r = best_circle
-    center_gap_x = circle_x_rel + right_region_start
-    center_gap_y = mid_y  # 强制对齐到中轴线
+    center_gap_y = mid_y
+    gap_radius = slider_radius
     
     log_debug(f"[距离计算] 缺口圆心: ({center_gap_x},{center_gap_y})")
-    log_debug(f"[距离计算] 距离中轴线评分: {best_score:.2f}")
+    log_debug(f"[距离计算] 缺口半径: {gap_radius} (基于滑块大小)")
     
     # ==========================================
     # 第七步：计算最终距离！

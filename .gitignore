@@ -40,3 +40,7 @@ bing_news.png
 error*.json
 memory.json
 processor_stats.json
+
+# Demo files
+blur_demo/
+blur_demo.py

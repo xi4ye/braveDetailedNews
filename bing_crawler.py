@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Bing 国内版爬虫 (CN)
-# 使用 Bing 国内版搜索引擎，默认中文搜索结果
 import asyncio
 import urllib.parse
 import base64
@@ -11,6 +9,7 @@ from pydoll.browser.options import ChromiumOptions
 from pydoll.commands import PageCommands
 from datetime import datetime, timedelta
 import re
+import random
 
 
 def extract_real_url(bing_url):
@@ -110,28 +109,39 @@ async def crawl_news(news,K=20, proxy=None):
     """
     options = ChromiumOptions()
 
-    # 中文 Windows User-Agent
+    has_chinese = any('\u4e00' <= c <= '\u9fff' for c in news)
+    
+    if has_chinese:
+        engine_region = "zh-CN"
+        accept_language = "zh-CN,zh;q=0.9,en;q=0.8"
+        setlang = "zh-CN"
+    else:
+        engine_region = "en-US"
+        accept_language = "en-US,en;q=0.9"
+        setlang = "en"
+    
+    print(f"[info] 市场: {engine_region}")
+    print(f"[info] 语言: {setlang}")
+
     options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
     
-    # 语言和地区设置
-    options.add_argument('--accept-lang=zh-CN,zh;q=0.9,en;q=0.8')
+    options.add_argument(f'--accept-lang={accept_language}')
     
-    # 反检测设置
     options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--no-sandbox')  # 禁止沙箱模式
+    options.add_argument('--no-sandbox')
     options.add_argument('--remote-allow-origins=*') 
-    options.add_argument('--disable-dev-shm-usage')  # 解决资源受限
+    options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-infobars')
     options.add_argument('--disable-extensions')
     options.add_argument('--window-size=1920,1080')
-    options.add_argument('--headless=new') 
-
-    # 代理设置（默认 127.0.0.1:7890）
+    options.add_argument('--headless=new')# 代理设置（默认不使用代理）
     if proxy is None:
-        proxy = "127.0.0.1:7890"
+        proxy = None
     if proxy:
         options.add_argument(f'--proxy-server={proxy}')
         print(f"[info] 使用代理: {proxy}")
+    else:
+        print(f"[info] 不使用代理")
     async with Edge(options=options) as browser:
 
         page =  await browser.start()
@@ -149,24 +159,78 @@ async def crawl_news(news,K=20, proxy=None):
             )
             print("[info] 已持久化注入 stealth.min.js（跨导航生效）")
         else:
-            print("[warning] 未找到 stealth.min.js，使用简化版本")
+            print("[warning] 未找到 stealth.min.js，使用增强版反检测脚本")
+            enhanced_stealth = """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'automation', { get: () => undefined });
+                window.chrome = { 
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {},
+                    app: {}
+                };
+                Object.defineProperty(navigator, 'plugins', { 
+                    get: () => [
+                        {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
+                        {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                        {name: 'Native Client', filename: 'internal-nacl-plugin'}
+                    ]
+                });
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+                
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+                
+                Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
+                    value: function() {
+                        return {
+                            fillStyle: '',
+                            font: '',
+                            getImageData: function() { return { data: new Uint8ClampedArray(4) }; },
+                            measureText: function() { return { width: 0 }; },
+                            strokeText: function() {},
+                            fillText: function() {}
+                        };
+                    }
+                });
+                
+                window.Notification = window.Notification || function() {};
+            """
             await page._execute_command(
                 PageCommands.add_script_to_evaluate_on_new_document(
-                    source="""
-                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                        window.chrome = { runtime: {} };
-                        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                        Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-                    """,
+                    source=enhanced_stealth,
                     run_immediately=True,
                 )
             )
 
-        # 不用引号包裹搜索词（cn.bing.com 用引号反而匹配更差）
         encoded_news = urllib.parse.quote(news)
-        await page.go_to(f'https://cn.bing.com/search?q={encoded_news}')
         
-        await asyncio.sleep(8)  # 等待页面加载
+        query_params = {
+            "q": news,
+            "mkt": engine_region,
+            "setlang": setlang,
+            "cc": engine_region.split("-")[1] if "-" in engine_region else "CN"
+        }
+        
+        if has_chinese:
+            base_domain = "https://cn.bing.com"
+        else:
+            base_domain = "https://www.bing.com"
+        
+        search_url = f'{base_domain}/search?{urllib.parse.urlencode(query_params)}'
+        print(f"[debug] 搜索 URL: {search_url}")
+        
+        await page.go_to(search_url)
+        
+        await asyncio.sleep(random.uniform(5.0, 8.0))
         i = 0
         result = []
         # intnet = await page.find_or_wait_element(By.ID, "est_en",timeout=15)
@@ -210,12 +274,11 @@ async def crawl_news(news,K=20, proxy=None):
                     "source": "Bing"
                 })
             
-            # 点击下一页（如果存在）
             if i < K:
                 try:
                     btn = await page.find_or_wait_element(By.CLASS_NAME, "sb_pagN", timeout=3)
                     await btn.click()
-                    await asyncio.sleep(8)  # 等待页面加载
+                    await asyncio.sleep(random.uniform(5.0, 8.0))
                 except:
                     print("[info] 没有更多结果了")
                     break
@@ -227,7 +290,7 @@ if __name__ == "__main__":
     # ==============================
     # Bing 国内版 (CN) - 测试入口
     # ==============================
-    news = "近日，特朗普声称将与中国的关税提高到80%"
+    news = "科比"
     K = 5
     # query_date = "2025-07-30"
     asyncio.run(crawl_news(news, K))

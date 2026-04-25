@@ -583,10 +583,19 @@ class DeepSeekAgentWithTools:
 - 禁止使用 contains(text(), '某具体内容') 这种特定内容的定位方式
 - 应该使用页面结构特征：如 class名、id名、标签层级关系等
 
+【重要】必须排除以下标签内的内容：
+- <script> 标签：包含 JavaScript 代码，不是正文
+- <style> 标签：包含 CSS 样式，不是正文
+- <noscript> 标签：包含备用内容，不是正文
+- <svg> 标签：包含图标/图形，不是正文
+
 【正确示例】：
 - css_selector: "div.article-content", "#js_content", ".rich_media_content", "div.content article"
-- xpath: "//article//div[@class='content']", "//div[contains(@class, 'article-body')]"
+- xpath: "//article//div[@class='content']", "//div[contains(@class, 'article-body')]", "//div[@class='main']//p[not(ancestor::script or ancestor::style)]"
 - id: "artibody", "js_content", "article-content"
+
+【错误示例】（禁止使用）：
+- "//*[text()]" - 会匹配所有文本，包括 script/style 内的代码！
 
 当前新闻信息：
 - 标题: {news_item['title']}

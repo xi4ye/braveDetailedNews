@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import asyncio
+import argparse
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
@@ -1111,12 +1112,19 @@ class DeepSeekAgentWithTools:
 - 禁止使用 contains(text(), '某具体内容') 这种特定内容的定位方式
 - 应该使用页面结构特征：如 class名、id名、标签层级关系等
 
+【重要】必须排除以下标签内的内容：
+- <script> 标签：包含 JavaScript 代码，不是正文
+- <style> 标签：包含 CSS 样式，不是正文
+- <noscript> 标签：包含备用内容，不是正文
+- <svg> 标签：包含图标/图形，不是正文
+
 【正文定位正确示例】：
 - css_selector: "div.article-content", "#js_content", ".rich_media_content", "div.content article"
-- xpath: "//article//div[@class='content']", "//div[contains(@class, 'article-body')]"
+- xpath: "//article//div[@class='content']", "//div[contains(@class, 'article-body')]", "//div[@class='main']//p[not(ancestor::script or ancestor::style)]"
 - id: "artibody", "js_content", "article-content"
 
 【正文定位错误示例】（禁止使用）：
+- "//*[text()]" - 会匹配所有文本，包括 script/style 内的代码！
 - "//p[contains(text(), '摩尔线程')]" - 包含文章特定内容
 - "//div[contains(., '9月26日')]" - 包含日期
 - "//*[contains(text(), '公司仅用88天')]" - 包含文章特定内容
@@ -1749,7 +1757,18 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
                         _current_news_info['_date_no_text'] = True
 
         if final_content:
-            result_item = {**news_item, 'content': final_content, '_id': news_id, 'status': 'success', 'used_pure_script': True, 'used_agent': False, 'used_date_agent': False}
+            result_item = {
+                **news_item, 
+                'content': final_content, 
+                '_id': news_id, 
+                'status': 'success', 
+                'used_pure_script': True, 
+                'used_agent': False, 
+                'used_date_agent': False,
+                '_date_extract_success': _current_news_info.get('_date_extract_success', False),
+                '_date_parse_fail': _current_news_info.get('_date_parse_fail', False),
+                '_date_no_text': _current_news_info.get('_date_no_text', False)
+            }
 
             if final_date:
                 result_item['parsed_date'] = final_date
@@ -1957,14 +1976,22 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
         return False, result_item
 
 
-def process_jsonl_file(jsonl_file: str):
-    """处理JSONL文件"""
+def process_jsonl_file(jsonl_file: str, proxy: str = None):
+    """处理JSONL文件
+    
+    Args:
+        jsonl_file: 输入的JSONL文件路径
+        proxy: 代理服务器地址，如 "127.0.0.1:7890"
+    """
     start_time = datetime.now()
     global _browser_manager, _memory_manager_global
     
     memory_manager = MemoryManager(MEMORY_FILE)
     error_manager = ErrorManager(ERROR_FILE)
     _memory_manager_global = memory_manager
+    
+    if proxy:
+        print(f"[代理] 使用代理: {proxy}")
     
     total_items = 0
     news_items = []
@@ -1989,7 +2016,7 @@ def process_jsonl_file(jsonl_file: str):
         return
     
     _browser_manager = BrowserManager()
-    _browser_manager.start()
+    _browser_manager.start(proxy=proxy)
     
     agent = DeepSeekAgentWithTools(DEEPSEEK_CONFIG, memory_manager)
     
@@ -2215,7 +2242,16 @@ def process_jsonl_file(jsonl_file: str):
 
 
 if __name__ == "__main__":
-    print(f"使用测试文件: {INPUT_JSONL_FILE}")
+    parser = argparse.ArgumentParser(description='新闻JSONL批量处理工具')
+    parser.add_argument('--input', '-i', type=str, default=INPUT_JSONL_FILE,
+                        help=f'输入的JSONL文件路径 (默认: {INPUT_JSONL_FILE})')
+    parser.add_argument('--proxy', '-p', type=str, default=None,
+                        help='代理服务器地址，如 "127.0.0.1:7890"')
+    args = parser.parse_args()
+    
+    print(f"使用输入文件: {args.input}")
+    if args.proxy:
+        print(f"使用代理: {args.proxy}")
     print("开始处理...")
-    process_jsonl_file(INPUT_JSONL_FILE)
+    process_jsonl_file(args.input, proxy=args.proxy)
     print("处理结束")

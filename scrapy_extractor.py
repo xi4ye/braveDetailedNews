@@ -244,7 +244,10 @@ class ScrapyExtractor:
             if locator_type == "css_selector":
                 text = selector.css(locator_value + " ::text").getall()
             elif locator_type == "xpath":
-                text = selector.xpath(locator_value + "//text()").getall()
+                if "text()" in locator_value:
+                    text = selector.xpath(locator_value).getall()
+                else:
+                    text = selector.xpath(locator_value + "//text()").getall()
             elif locator_type == "id":
                 text = selector.css(f"#{locator_value} ::text").getall()
             elif locator_type == "class":
