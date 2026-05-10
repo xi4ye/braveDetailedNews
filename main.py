@@ -103,11 +103,23 @@ def get_crawler(source: str):
         return bing_en_crawl
 
 
-def process_news_with_processor():
-    """调用 news_processor 处理新闻列表"""
+def process_news_with_processor(use_threaded=True):
+    """调用 news_processor 处理新闻列表
+    
+    Args:
+        use_threaded: 是否使用多线程版本（默认True）
+    """
     try:
+        # 选择处理器版本
+        if use_threaded:
+            processor_script = "news_processor_threaded.py"
+            print("使用 Scrapy 异步版本（多线程）处理新闻...")
+        else:
+            processor_script = "news_processor.py"
+            print("使用串行版本处理新闻...")
+        
         result = subprocess.run(
-            [sys.executable, "news_processor.py"],
+            [sys.executable, processor_script],
             cwd=os.getcwd(),
             capture_output=False,
             text=True
@@ -184,7 +196,7 @@ async def main():
     print(f"# 新闻爬取与处理（命令行模式）")
     print(f"# 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"# 搜索引擎: {source}")
-    print(f"# 处理模式: 串行处理")
+    print(f"# 处理模式: Scrapy 异步爬取 + 多线程 Agent")
     print(f"{'#'*60}\n")
 
     print(f"配置:")
@@ -217,9 +229,10 @@ async def main():
 
     print(f"\n{'='*60}")
     print(f"# 阶段 2：处理新闻（提取正文）")
+    print(f"# 使用 Scrapy 异步爬取 + 多线程 Agent")
     print(f"{'='*60}\n")
 
-    success = process_news_with_processor()
+    success = process_news_with_processor(use_threaded=True)
 
     end_time = datetime.now()
     elapsed = (end_time - start_time).total_seconds()

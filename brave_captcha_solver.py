@@ -620,8 +620,8 @@ class BraveSliderCaptchaSolver:
     def __init__(self, tab):
         self.tab = tab
         self.attempt = 0
-        self.crop_x = 805
-        self.crop_y = 417
+        self.crop_x = 800
+        self.crop_y = 420
         self.crop_width = 310
         self.crop_height = 153
 

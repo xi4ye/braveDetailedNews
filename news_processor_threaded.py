@@ -1,20 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-新闻JSONL批量处理工具 - 多线程版本
-功能：使用多线程并发处理多条新闻
+新闻JSONL批量处理工具 - Scrapy版本
+功能：使用Scrapy异步爬取 + 多线程Agent处理
 """
+
+# 必须在所有导入之前安装 reactor
+from twisted.internet import asyncioreactor
+try:
+    asyncioreactor.install()
+except:
+    pass  # 如果已经安装，忽略错误
 
 import json
 import os
 import re
 import sqlite3
+import sys
 import threading
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import scrapy
+from scrapy.crawler import CrawlerRunner
+from scrapy.utils.log import configure_logging
+from scrapy.settings import Settings
+from twisted.internet import reactor, defer
+from twisted.internet.threads import deferToThread
 
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -33,11 +48,73 @@ PURE_SCRIPT_THRESHOLD = 1
 MAX_WORKERS = 5  # 线程数，可以根据实际情况调整
 STATS_FILE = "processor_stats.json"  # 统计信息保存文件
 
+# API限流配置
+API_RATE_LIMIT_QPS = 3.0  # 每秒最多3次API调用（专业版）
+API_RATE_LIMIT_ENABLED = True  # 是否启用API限流
+
 
 DEEPSEEK_CONFIG = {
     "model": "deepseek-chat",
     "base_url": "https://api.deepseek.com/v1",
     "api_key": os.environ.get("DEEPSEEK_API_KEY", "")
+}
+
+
+class APIRateLimiter:
+    """API调用限流器 - 使用令牌桶算法
+    
+    防止多个Agent同时调用API导致限流
+    """
+    
+    def __init__(self, qps: float = 3.0, enabled: bool = True):
+        self.qps = qps
+        self.enabled = enabled
+        self.min_interval = 1.0 / qps if qps > 0 else 0
+        self.last_call_time = 0.0
+        self.lock = threading.Lock()
+        self.call_count = 0
+        self.wait_count = 0
+    
+    def acquire(self):
+        """获取调用许可（会阻塞直到可以调用）"""
+        if not self.enabled:
+            return
+        
+        with self.lock:
+            current_time = time.time()
+            elapsed = current_time - self.last_call_time
+            
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                time.sleep(wait_time)
+                self.wait_count += 1
+            
+            self.last_call_time = time.time()
+            self.call_count += 1
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        with self.lock:
+            return {
+                "total_calls": self.call_count,
+                "total_waits": self.wait_count,
+                "qps_limit": self.qps,
+                "enabled": self.enabled
+            }
+
+
+# 全局API限流器实例
+api_rate_limiter = APIRateLimiter(qps=API_RATE_LIMIT_QPS, enabled=API_RATE_LIMIT_ENABLED)
+
+# 全局变量：存储 spider 的结果和统计
+_spider_results = []
+_spider_stats = {
+    'processed_count': 0,
+    'success_count': 0,
+    'pure_script_count': 0,
+    'blacklisted_count': 0,
+    'agent_count': 0,
+    'agent_success_count': 0,
 }
 
 
@@ -84,50 +161,91 @@ _thread_local = ThreadLocalContext()
 
 
 class ThreadSafeMemoryManager:
-    """线程安全的 MemoryManager - 使用 SQLite 的 WAL 模式减少锁争用"""
+    """线程安全的 MemoryManager - 使用读写锁保护所有数据库操作
+    
+    并发规则：
+    1. 读操作可以并发（多个线程同时读）
+    2. 写操作必须独占（一个线程写时，其他线程不能读也不能写）
+    3. 使用 threading.Lock() 实现互斥访问
+    """
     
     def __init__(self, memory_file):
         self.db_file = memory_file.replace('.json', '.db')
+        self._lock = threading.Lock()  # 全局锁，保护所有数据库操作
         self._init_db()
     
     def _get_conn(self):
+        """获取数据库连接（已加锁保护）"""
         conn = sqlite3.connect(self.db_file, check_same_thread=False, timeout=30)
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=30000')  # 30秒超时
         return conn
     
     def _init_db(self):
-        conn = self._get_conn()
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS locators (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain TEXT NOT NULL,
-                locator_type TEXT NOT NULL,
-                locator_value TEXT NOT NULL,
-                locator_desc TEXT,
-                usage_count INTEGER DEFAULT 0,
-                success_count INTEGER DEFAULT 0,
-                create_time TEXT,
-                update_time TEXT,
-                UNIQUE(domain, locator_value)
-            )
-        ''')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_domain ON locators(domain)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_success ON locators(domain, success_count DESC)')
-        conn.commit()
-        conn.close()
+        """初始化数据库（加锁保护）"""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS locators (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        domain TEXT NOT NULL,
+                        locator_type TEXT NOT NULL,
+                        locator_value TEXT NOT NULL,
+                        locator_desc TEXT,
+                        usage_count INTEGER DEFAULT 0,
+                        success_count INTEGER DEFAULT 0,
+                        create_time TEXT,
+                        update_time TEXT,
+                        UNIQUE(domain, locator_value)
+                    )
+                ''')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_domain ON locators(domain)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_success ON locators(domain, success_count DESC)')
+                conn.commit()
+            finally:
+                conn.close()
     
     def get_locator_by_domain(self, domain: str) -> Optional[Dict]:
-        conn = self._get_conn()
-        try:
-            cursor = conn.execute('''
-                SELECT * FROM locators 
-                WHERE domain = ? 
-                ORDER BY success_count DESC 
-                LIMIT 1
-            ''', (domain,))
-            row = cursor.fetchone()
-            if row:
-                return {
+        """获取单个定位器（读操作，加锁保护）"""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cursor = conn.execute('''
+                    SELECT * FROM locators 
+                    WHERE domain = ? 
+                    ORDER BY success_count DESC 
+                    LIMIT 1
+                ''', (domain,))
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'id': row[0],
+                        'domain': row[1],
+                        'locator_type': row[2],
+                        'locator_value': row[3],
+                        'locator_desc': row[4],
+                        'usage_count': row[5],
+                        'success_count': row[6],
+                        'create_time': row[7],
+                        'update_time': row[8]
+                    }
+                return None
+            finally:
+                conn.close()
+    
+    def get_all_locators_by_domain(self, domain: str) -> List[Dict]:
+        """获取所有定位器（读操作，加锁保护）"""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cursor = conn.execute('''
+                    SELECT * FROM locators 
+                    WHERE domain = ? 
+                    ORDER BY success_count DESC
+                ''', (domain,))
+                rows = cursor.fetchall()
+                return [{
                     'id': row[0],
                     'domain': row[1],
                     'locator_type': row[2],
@@ -137,90 +255,85 @@ class ThreadSafeMemoryManager:
                     'success_count': row[6],
                     'create_time': row[7],
                     'update_time': row[8]
-                }
-            return None
-        finally:
-            conn.close()
-    
-    def get_all_locators_by_domain(self, domain: str) -> List[Dict]:
-        conn = self._get_conn()
-        try:
-            cursor = conn.execute('''
-                SELECT * FROM locators 
-                WHERE domain = ? 
-                ORDER BY success_count DESC
-            ''', (domain,))
-            rows = cursor.fetchall()
-            return [{
-                'id': row[0],
-                'domain': row[1],
-                'locator_type': row[2],
-                'locator_value': row[3],
-                'locator_desc': row[4],
-                'usage_count': row[5],
-                'success_count': row[6],
-                'create_time': row[7],
-                'update_time': row[8]
-            } for row in rows]
-        finally:
-            conn.close()
+                } for row in rows]
+            finally:
+                conn.close()
     
     def add_or_update_locator(self, domain: str, locator_type: str, locator_value: str, locator_desc: str = "") -> bool:
-        conn = self._get_conn()
-        try:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            cursor = conn.execute('''
-                SELECT id, usage_count, success_count FROM locators 
-                WHERE domain = ? AND locator_value = ?
-            ''', (domain, locator_value))
-            row = cursor.fetchone()
-            
-            if row:
-                conn.execute('''
-                    UPDATE locators 
-                    SET usage_count = ?, success_count = ?, update_time = ?
-                    WHERE id = ?
-                ''', (row[1] + 1, row[2] + 1, now, row[0]))
-            else:
-                conn.execute('''
-                    INSERT INTO locators 
-                    (domain, locator_type, locator_value, locator_desc, usage_count, success_count, create_time, update_time)
-                    VALUES (?, ?, ?, ?, 1, 1, ?, ?)
-                ''', (domain, locator_type, locator_value, locator_desc, now, now))
-            
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-    
-    def increment_locator_usage(self, domain: str, locator_value: str, success: bool = True):
-        conn = self._get_conn()
-        try:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            cursor = conn.execute('''
-                SELECT usage_count, success_count FROM locators 
-                WHERE domain = ? AND locator_value = ?
-            ''', (domain, locator_value))
-            row = cursor.fetchone()
-            
-            if row:
-                if success:
+        """添加或更新定位器（写操作，加锁保护）
+        
+        写操作规则：
+        - 同一时刻只能有 1 个线程写
+        - 写的时候，所有线程不能读
+        """
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                cursor = conn.execute('''
+                    SELECT id, usage_count, success_count FROM locators 
+                    WHERE domain = ? AND locator_value = ?
+                ''', (domain, locator_value))
+                row = cursor.fetchone()
+                
+                if row:
                     conn.execute('''
                         UPDATE locators 
-                        SET usage_count = usage_count + 1, success_count = success_count + 1, update_time = ?
-                        WHERE domain = ? AND locator_value = ?
-                    ''', (now, domain, locator_value))
+                        SET usage_count = ?, success_count = ?, update_time = ?
+                        WHERE id = ?
+                    ''', (row[1] + 1, row[2] + 1, now, row[0]))
                 else:
                     conn.execute('''
-                        UPDATE locators 
-                        SET usage_count = usage_count + 1, update_time = ?
-                        WHERE domain = ? AND locator_value = ?
-                    ''', (now, domain, locator_value))
+                        INSERT INTO locators 
+                        (domain, locator_type, locator_value, locator_desc, usage_count, success_count, create_time, update_time)
+                        VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+                    ''', (domain, locator_type, locator_value, locator_desc, now, now))
+                
                 conn.commit()
-        finally:
-            conn.close()
+                return True
+            except Exception as e:
+                print(f"[错误] 数据库写入失败: {e}")
+                return False
+            finally:
+                conn.close()
+    
+    def increment_locator_usage(self, domain: str, locator_value: str, success: bool = True):
+        """增加定位器使用次数（写操作，加锁保护）
+        
+        写操作规则：
+        - 同一时刻只能有 1 个线程写
+        - 写的时候，所有线程不能读
+        """
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                cursor = conn.execute('''
+                    SELECT usage_count, success_count FROM locators 
+                    WHERE domain = ? AND locator_value = ?
+                ''', (domain, locator_value))
+                row = cursor.fetchone()
+                
+                if row:
+                    if success:
+                        conn.execute('''
+                            UPDATE locators 
+                            SET usage_count = usage_count + 1, success_count = success_count + 1, update_time = ?
+                            WHERE domain = ? AND locator_value = ?
+                        ''', (now, domain, locator_value))
+                    else:
+                        conn.execute('''
+                            UPDATE locators 
+                            SET usage_count = usage_count + 1, update_time = ?
+                            WHERE domain = ? AND locator_value = ?
+                        ''', (now, domain, locator_value))
+                    conn.commit()
+            except Exception as e:
+                print(f"[错误] 数据库更新失败: {e}")
+            finally:
+                conn.close()
     
     def close(self):
         pass
@@ -623,6 +736,9 @@ class DeepSeekAgentWithTools:
             print(f"\n[Agent Step {step + 1}/{MAX_AGENT_STEPS}]")
             
             try:
+                # API限流：在调用API前获取许可
+                api_rate_limiter.acquire()
+                
                 response = self.llm_with_tools.invoke(messages)
                 messages.append(response)
                 
@@ -826,6 +942,325 @@ def process_single_news(news_item, agent_config, memory_manager, error_manager):
             
             content = browser_manager.extractor.extract_text_by_selector(
                 html_content, locator_type, locator_value
+            ) if browser_manager.extractor else ""
+            
+            if content and len(content) >= 100:
+                memory_manager.increment_locator_usage(final_domain, locator_value, success=True)
+                print(f"\n[纯脚本成功] 提取正文长度: {len(content)} 字符")
+                # browser_manager.stop()  # 暂时注释，避免多线程竞争
+                return True, {**news_item, 'content': content, '_id': news_id, 'status': 'success', 'used_pure_script': True, 'used_agent': False}
+            else:
+                memory_manager.increment_locator_usage(final_domain, locator_value, success=False)
+                print(f"[纯脚本 {idx}/{len(locators)}] 失败")
+                sys.stdout.flush()
+        
+        print(f"[纯脚本全部失败] 回退到 Agent 处理")
+        sys.stdout.flush()
+    
+    print(f"[Agent模式] 域名 {final_domain} 无有效定位器或纯脚本失败")
+    print(f"{'='*60}")
+    sys.stdout.flush()
+    
+    thread_news_info = {
+        'title': news_item['title'],
+        'url': url,
+        'author': news_item['author'],
+        'source': news_item.get('source', ''),
+        'domain': final_domain,
+        'html_content': html_content
+    }
+    _thread_local.init_context(browser_manager, thread_news_info)
+    
+    agent = DeepSeekAgentWithTools(agent_config)
+    
+    used_agent = True
+    try:
+        result = agent.process_news(news_item)
+        
+        if result.get("success"):
+            content = result.get("content", "")
+            locator = result.get("locator")
+            
+            if locator:
+                loc_domain = locator.get('domain', '')
+                existing = memory_manager.get_locator_by_domain(loc_domain)
+                if existing:
+                    old_locator_value = existing.get('locator_value', '')
+                    new_locator_value = locator.get('locator_value', '')
+                    
+                    if old_locator_value != new_locator_value:
+                        memory_manager.add_or_update_locator(
+                            loc_domain,
+                            locator.get('locator_type', 'xpath'),
+                            new_locator_value,
+                            locator.get('locator_desc', '')
+                        )
+                        print(f"\n[新增] 域名 {loc_domain} 添加新定位规则: {old_locator_value} -> {new_locator_value}")
+                    else:
+                        memory_manager.increment_locator_usage(loc_domain, new_locator_value, success=True)
+                        print(f"\n[复用] 使用了缓存定位规则，域名: {loc_domain}")
+                else:
+                    memory_manager.add_or_update_locator(
+                        loc_domain,
+                        locator.get('locator_type', 'xpath'),
+                        locator.get('locator_value', ''),
+                        locator.get('locator_desc', '')
+                    )
+                    print(f"\n[新增] 域名 {loc_domain} 首次添加定位规则: {locator.get('locator_value', '')}")
+            
+            print(f"\n[成功] 提取正文长度: {len(content)} 字符")
+            # browser_manager.stop()  # 暂时注释，避免多线程竞争
+            return True, {**news_item, 'content': content, '_id': news_id, 'status': 'success', 'used_agent': used_agent}
+        else:
+            error_reason = result.get('error', '未知错误')
+            error_manager.add_error(final_domain, error_reason)
+            print(f"\n[失败] {error_reason}")
+            # browser_manager.stop()  # 暂时注释，避免多线程竞争
+            return False, {**news_item, 'content': '', '_id': news_id, 'status': 'failed', 'used_agent': used_agent}
+            
+    except Exception as e:
+        error_manager.add_error(final_domain, f"处理异常: {str(e)}")
+        print(f"\n[异常] 处理失败: {e}")
+        # browser_manager.stop()  # 暂时注释，避免多线程竞争
+        return False, {**news_item, 'content': '', '_id': news_id, 'status': 'error', 'used_agent': used_agent}
+
+
+class NewsSpider(scrapy.Spider):
+    """Scrapy爬虫 - 异步爬取新闻页面"""
+    name = 'news_spider'
+    
+    custom_settings = {
+        'CONCURRENT_REQUESTS': 5,
+        'CONCURRENT_REQUESTS_PER_DOMAIN': 5,
+        'DOWNLOAD_DELAY': 0.5,
+        'RANDOMIZE_DOWNLOAD_DELAY': True,
+        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'ROBOTSTXT_OBEY': False,
+        'RETRY_ENABLED': True,
+        'RETRY_TIMES': 3,
+        'DOWNLOAD_TIMEOUT': 30,
+    }
+    
+    def __init__(self, news_list=None, memory_manager=None, error_manager=None, *args, **kwargs):
+        super(NewsSpider, self).__init__(*args, **kwargs)
+        self.news_list = news_list or []
+        self.memory_manager = memory_manager
+        self.error_manager = error_manager
+        self.results = []
+        self.stats = {
+            'processed_count': 0,
+            'success_count': 0,
+            'pure_script_count': 0,
+            'blacklisted_count': 0,
+            'agent_count': 0,
+            'agent_success_count': 0,
+        }
+        
+        # 设置全局变量
+        global _spider_results, _spider_stats
+        _spider_results = self.results
+        _spider_stats = self.stats
+    
+    def start_requests(self):
+        for news_item in self.news_list:
+            url = news_item.get('url', '')
+            if not url:
+                continue
+            
+            if url.startswith('//'):
+                url = 'https:' + url
+            elif not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            
+            # 在发起请求前检测黑名单
+            from urllib.parse import urlparse
+            domain = urlparse(url).netloc
+            
+            if self.error_manager.is_blacklisted(domain):
+                print(f"\n{'='*60}")
+                print(f"[跳过] 域名 {domain} 在黑名单中")
+                print(f"URL: {url}")
+                sys.stdout.flush()
+                result_item = {**news_item, 'content': '', 'status': 'blacklisted'}
+                self.results.append(result_item)
+                self.stats['processed_count'] += 1
+                self.stats['blacklisted_count'] += 1
+                continue  # 跳过，不发起请求
+            
+            yield scrapy.Request(
+                url=url,
+                callback=self.parse,
+                meta={'news_item': news_item},
+                errback=self.errback,
+                dont_filter=True
+            )
+    
+    def parse(self, response):
+        news_item = response.meta['news_item']
+        html_content = response.text
+        final_url = response.url
+        status_code = response.status
+        final_domain = urlparse(final_url).netloc
+        
+        print(f"\n{'='*60}")
+        print(f"处理新闻: {news_item.get('title', '未知标题')[:50]}...")
+        print(f"来源: {news_item.get('author', '未知')}")
+        print(f"域名: {final_domain}")
+        print(f"URL: {final_url}")
+        print(f"HTTP状态: {status_code}")
+        sys.stdout.flush()  # 强制刷新输出
+        
+        # 注意：黑名单检测已在 start_requests() 中完成
+        # 这里不再重复检测
+        
+        if status_code >= 400:
+            self.error_manager.add_error(final_domain, f"HTTP {status_code}")
+            print(f"[失败] 页面加载失败（HTTP {status_code}）")
+            sys.stdout.flush()
+            result_item = {**news_item, 'content': '', 'status': 'http_error'}
+            self.results.append(result_item)
+            self.stats['processed_count'] += 1
+            return
+        
+        if not html_content:
+            self.error_manager.add_error(final_domain, "页面内容为空")
+            print(f"[失败] 页面内容为空")
+            sys.stdout.flush()
+            result_item = {**news_item, 'content': '', 'status': 'empty_content'}
+            self.results.append(result_item)
+            self.stats['processed_count'] += 1
+            return
+        
+        print(f"[成功] 页面加载成功，HTML长度: {len(html_content)} 字符")
+        sys.stdout.flush()
+        
+        # 使用 inlineCallbacks 处理异步操作
+        from twisted.internet import defer as twisted_defer
+        
+        @twisted_defer.inlineCallbacks
+        def process_async():
+            try:
+                result = yield deferToThread(
+                    self._process_in_thread,
+                    news_item,
+                    html_content,
+                    final_url,
+                    final_domain
+                )
+                
+                success, result_item = result
+                self.results.append(result_item)
+                self.stats['processed_count'] += 1
+                
+                if success:
+                    self.stats['success_count'] += 1
+                    if result_item.get('used_pure_script'):
+                        self.stats['pure_script_count'] += 1
+                    print(f"[完成] 处理成功，正文长度: {len(result_item.get('content', ''))} 字符")
+                else:
+                    print(f"[完成] 处理失败")
+                sys.stdout.flush()
+                
+                if result_item.get('used_agent'):
+                    self.stats['agent_count'] += 1
+                    if success:
+                        self.stats['agent_success_count'] += 1
+            except Exception as e:
+                print(f"[错误] 处理失败: {e}")
+                sys.stdout.flush()
+                news_id = re.sub(r'[^\w\-]', '_', f"{news_item.get('author', 'unknown')}_{news_item.get('title', 'unknown')[:20]}")
+                result_item = news_item.copy()
+                result_item['content'] = ''
+                result_item['_id'] = news_id
+                result_item['used_agent'] = False
+                self.results.append(result_item)
+                self.stats['processed_count'] += 1
+            
+            # 返回空列表，而不是 None
+            twisted_defer.returnValue([])
+        
+        return process_async()
+    
+    def _process_in_thread(self, news_item, html_content, final_url, final_domain):
+        """在线程池中处理（避免阻塞Scrapy）"""
+        return process_single_news_with_html(
+            news_item,
+            html_content,
+            final_url,
+            final_domain,
+            DEEPSEEK_CONFIG,
+            self.memory_manager,
+            self.error_manager
+        )
+    
+    def errback(self, failure):
+        news_item = failure.request.meta['news_item']
+        print(f"\n{'='*60}")
+        print(f"[错误] 爬取失败: {failure.request.url}")
+        print(f"错误原因: {str(failure)}")
+        sys.stdout.flush()
+        
+        news_id = re.sub(r'[^\w\-]', '_', f"{news_item.get('author', 'unknown')}_{news_item.get('title', 'unknown')[:20]}")
+        result_item = news_item.copy()
+        result_item['content'] = ''
+        result_item['_id'] = news_id
+        result_item['used_agent'] = False
+        self.results.append(result_item)
+        self.stats['processed_count'] += 1
+
+
+def process_single_news_with_html(news_item, html_content, final_url, final_domain, agent_config, memory_manager, error_manager):
+    """处理单条新闻（已有HTML内容）"""
+    browser_manager = ScrapyManager()
+    browser_manager.start()
+    
+    # 确保 extractor 已初始化
+    if not browser_manager.extractor:
+        print("[错误] Scrapy 提取器初始化失败")
+        news_id = re.sub(r'[^\w\-]', '_', f"{news_item.get('author', 'unknown')}_{news_item.get('title', 'unknown')[:20]}")
+        return False, {**news_item, 'content': '', '_id': news_id, 'status': 'error', 'used_agent': False}
+    
+    news_id = re.sub(r'[^\w\-]', '_', f"{news_item['author']}_{news_item['title'][:20]}")
+    
+    if not all(key in news_item for key in ['title', 'url', 'author']):
+        print(f"字段缺失，跳过: {news_item.get('title', '未知标题')}")
+        browser_manager.stop()
+        return False, {**news_item, 'content': '', '_id': news_id}
+    
+    url = news_item['url']
+    if url.startswith('//'):
+        url = 'https:' + url
+    elif not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    print(f"\n{'='*60}")
+    print(f"处理新闻: {news_item['title'][:50]}...")
+    print(f"来源: {news_item['author']}")
+    print(f"域名: {final_domain}")
+    print(f"URL: {final_url}")
+    
+    locators = memory_manager.get_all_locators_by_domain(final_domain)
+    if locators:
+        print(f"[纯脚本模式] 域名 {final_domain} 找到 {len(locators)} 个定位器")
+        print(f"{'='*60}")
+        
+        thread_news_info = {
+            'title': news_item['title'],
+            'url': url,
+            'author': news_item['author'],
+            'source': news_item.get('source', ''),
+            'domain': final_domain,
+            'html_content': html_content
+        }
+        _thread_local.init_context(browser_manager, thread_news_info)
+        
+        for idx, locator in enumerate(locators, 1):
+            locator_type = locator.get('locator_type', '')
+            locator_value = locator.get('locator_value', '')
+            print(f"[纯脚本 {idx}/{len(locators)}] 使用 {locator_type}={locator_value} 提取正文")
+            
+            content = browser_manager.extractor.extract_text_by_selector(
+                html_content, locator_type, locator_value
             )
             
             if content and len(content) >= 100:
@@ -906,8 +1341,9 @@ def process_single_news(news_item, agent_config, memory_manager, error_manager):
         return False, {**news_item, 'content': '', '_id': news_id, 'status': 'error', 'used_agent': used_agent}
 
 
-def process_jsonl_file_threaded(jsonl_file: str, max_workers: int = MAX_WORKERS):
-    """多线程处理JSONL文件"""
+@defer.inlineCallbacks
+def process_jsonl_file_scrapy(jsonl_file: str, concurrent_requests: int = 5):
+    """使用Scrapy处理JSONL文件"""
     start_time = datetime.now()
     memory_manager = ThreadSafeMemoryManager(MEMORY_FILE)
     error_manager = ThreadSafeErrorManager(ERROR_FILE)
@@ -935,113 +1371,132 @@ def process_jsonl_file_threaded(jsonl_file: str, max_workers: int = MAX_WORKERS)
         return
     
     print(f"\n{'#'*60}")
-    print(f"# 多线程处理模式")
-    print(f"# 线程数: {max_workers}")
+    print(f"# Scrapy异步爬取模式")
+    print(f"# 并发请求数: {concurrent_requests}")
     print(f"# 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*60}\n")
     
-    processed_count = 0
-    success_count = 0
-    pure_script_count = 0
-    blacklisted_count = 0
-    agent_count = 0
-    agent_success_count = 0
-    news_results = []
+    configure_logging({'LOG_LEVEL': 'ERROR'})  # 只显示错误日志，其他用 print 输出
     
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_news = {
-                executor.submit(
-                    process_single_news, 
-                    item, 
-                    DEEPSEEK_CONFIG, 
-                    memory_manager, 
-                    error_manager
-                ): item for item in news_items
-            }
-            
-            for future in tqdm(as_completed(future_to_news), total=total_items, desc="处理进度"):
-                news_item = future_to_news[future]
-                try:
-                    success, result_item = future.result()
-                    news_results.append(result_item)
-                    processed_count += 1
-                    
-                    if success:
-                        success_count += 1
-                        if result_item.get('used_pure_script'):
-                            pure_script_count += 1
-                    elif result_item.get('status') == 'blacklisted':
-                        blacklisted_count += 1
-                    
-                    if result_item.get('used_agent'):
-                        agent_count += 1
-                        if success:
-                            agent_success_count += 1
-                        
-                except Exception as e:
-                    print(f"处理新闻失败: {e}")
-                    news_id = re.sub(r'[^\w\-]', '_', f"{news_item.get('author', 'unknown')}_{news_item.get('title', 'unknown')[:20]}")
-                    result_item = news_item.copy()
-                    result_item['content'] = ''
-                    result_item['_id'] = news_id
-                    result_item['used_agent'] = False
-                    news_results.append(result_item)
-                    processed_count += 1
+    # 直接创建 Settings 对象，而不是从项目加载
+    from scrapy.settings import Settings
+    settings = Settings()
+    settings.set('CONCURRENT_REQUESTS', concurrent_requests)
+    settings.set('CONCURRENT_REQUESTS_PER_DOMAIN', concurrent_requests)
+    settings.set('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+    settings.set('ROBOTSTXT_OBEY', False)
+    settings.set('RETRY_ENABLED', True)
+    settings.set('RETRY_TIMES', 3)
+    settings.set('DOWNLOAD_TIMEOUT', 30)
+    settings.set('LOG_LEVEL', 'INFO')
     
-    finally:
-        pass
+    runner = CrawlerRunner(settings)
+    
+    # 传递 spider 类和参数，而不是 spider 对象
+    yield runner.crawl(
+        NewsSpider,
+        news_list=news_items,
+        memory_manager=memory_manager,
+        error_manager=error_manager
+    )
     
     end_time = datetime.now()
     elapsed_seconds = (end_time - start_time).total_seconds()
     
     print(f"\n\n{'='*60}")
     print(f"写入结果到 {OUTPUT_JSONL_FILE}...")
+    
+    # 使用全局变量获取 spider 的结果
+    spider_results = _spider_results
+    stats = _spider_stats
+    
     with open(OUTPUT_JSONL_FILE, 'w', encoding='utf-8') as f:
-        for item in news_results:
+        for item in spider_results:
             f.write(json.dumps(item, ensure_ascii=False) + '\n')
     
     print(f"\n处理完成!")
     print(f"  总条数: {total_items}")
-    print(f"  处理条数: {processed_count}")
-    print(f"  成功条数: {success_count}")
-    print(f"  纯脚本提取: {pure_script_count}")
-    print(f"  黑名单跳过: {blacklisted_count}")
-    print(f"  正文成功率: {success_count/total_items*100:.1f}%" if total_items > 0 else "  正文成功率: 0%")
-    print(f"  调用Agent次数: {agent_count}")
-    print(f"  调用Agent率: {agent_count/total_items*100:.1f}%" if total_items > 0 else "  调用Agent率: 0%")
-    print(f"  Agent调用成功次数: {agent_success_count}")
-    print(f"  Agent调用成功率: {agent_success_count/agent_count*100:.1f}%" if agent_count > 0 else "  Agent调用成功率: 0%")
+    print(f"  处理条数: {stats['processed_count']}")
+    print(f"  成功条数: {stats['success_count']}")
+    print(f"  纯脚本提取: {stats['pure_script_count']}")
+    print(f"  黑名单跳过: {stats['blacklisted_count']}")
+    print(f"  正文成功率: {stats['success_count']/total_items*100:.1f}%" if total_items > 0 else "  正文成功率: 0%")
+    print(f"  调用Agent次数: {stats['agent_count']}")
+    print(f"  调用Agent率: {stats['agent_count']/total_items*100:.1f}%" if total_items > 0 else "  调用Agent率: 0%")
+    print(f"  Agent调用成功次数: {stats['agent_success_count']}")
+    print(f"  Agent调用成功率: {stats['agent_success_count']/stats['agent_count']*100:.1f}%" if stats['agent_count'] > 0 else "  Agent调用成功率: 0%")
     print(f"  完成所需时间: {elapsed_seconds:.1f}秒")
+    
+    # 输出API限流统计
+    api_stats = api_rate_limiter.get_stats()
+    print(f"\nAPI限流统计:")
+    print(f"  总API调用次数: {api_stats['total_calls']}")
+    print(f"  限流等待次数: {api_stats['total_waits']}")
+    print(f"  QPS限制: {api_stats['qps_limit']}")
+    print(f"  限流启用: {api_stats['enabled']}")
+    
     print(f"{'='*60}")
     
-    stats = {
+    final_stats = {
         "start_time": start_time.strftime('%Y-%m-%d %H:%M:%S'),
         "end_time": end_time.strftime('%Y-%m-%d %H:%M:%S'),
         "elapsed_seconds": elapsed_seconds,
         "total_items": total_items,
-        "processed_count": processed_count,
-        "success_count": success_count,
-        "pure_script_count": pure_script_count,
-        "blacklisted_count": blacklisted_count,
-        "agent_count": agent_count,
-        "agent_success_count": agent_success_count,
-        "agent_success_rate": agent_success_count / agent_count * 100 if agent_count > 0 else 0,
-        "success_rate": success_count / total_items * 100 if total_items > 0 else 0,
-        "agent_rate": agent_count / total_items * 100 if total_items > 0 else 0
+        "processed_count": stats['processed_count'],
+        "success_count": stats['success_count'],
+        "pure_script_count": stats['pure_script_count'],
+        "blacklisted_count": stats['blacklisted_count'],
+        "agent_count": stats['agent_count'],
+        "agent_success_count": stats['agent_success_count'],
+        "agent_success_rate": stats['agent_success_count'] / stats['agent_count'] * 100 if stats['agent_count'] > 0 else 0,
+        "success_rate": stats['success_count'] / total_items * 100 if total_items > 0 else 0,
+        "agent_rate": stats['agent_count'] / total_items * 100 if total_items > 0 else 0,
+        "api_rate_limit": api_rate_limiter.get_stats()
     }
     
     try:
         with open(STATS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
+            json.dump(final_stats, f, ensure_ascii=False, indent=2)
         print(f"统计信息已保存到 {STATS_FILE}")
     except Exception as e:
         print(f"保存统计信息失败: {e}")
 
 
+def process_jsonl_file_threaded(jsonl_file: str, max_workers: int = MAX_WORKERS):
+    """兼容接口：使用Scrapy处理"""
+    process_jsonl_file_scrapy(jsonl_file, concurrent_requests=max_workers)
+
+
 if __name__ == "__main__":
     print(f"使用测试文件: {INPUT_JSONL_FILE}")
-    print(f"线程数: {MAX_WORKERS}")
-    print("开始多线程处理...")
-    process_jsonl_file_threaded(INPUT_JSONL_FILE)
-    print("处理结束")
+    print(f"并发请求数: {MAX_WORKERS}")
+    print("开始Scrapy异步爬取处理...")
+    
+    from twisted.internet import reactor
+    
+    def run_processing():
+        """启动处理流程"""
+        d = process_jsonl_file_scrapy(INPUT_JSONL_FILE, concurrent_requests=MAX_WORKERS)
+        
+        def stop_reactor(result):
+            print("处理结束")
+            reactor.stop()
+            return result
+        
+        def handle_error(failure):
+            print(f"处理出错: {failure}")
+            reactor.stop()
+            return failure
+        
+        d.addCallback(stop_reactor)
+        d.addErrback(handle_error)
+        
+        return d
+    
+    # 延迟启动，确保 reactor 已经运行
+    reactor.callWhenRunning(run_processing)
+    
+    # 启动 reactor（会阻塞直到处理完成）
+    reactor.run()
+    
+    print("程序结束")

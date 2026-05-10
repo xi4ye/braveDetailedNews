@@ -327,7 +327,7 @@ if __name__ == "__main__":
     # ==============================
     # Bing 国际版 (EN) - 测试入口
     # ==============================
-    news = "Iran has closed the Strait of Hormuz"
+    news = "White House press conference hit by shooting"
     K = 5
     # query_date = "2025-07-30"
     asyncio.run(crawl_news(news, K))

@@ -1,0 +1,23 @@
+# 核心依赖
+scrapy>=2.11.0
+twisted>=22.10.0
+parsel>=1.8.1
+
+# LangChain 相关
+langchain-openai>=0.1.0
+langchain-core>=0.1.0
+
+# HTTP 请求
+requests>=2.31.0
+urllib3>=2.0.0
+
+# 工具库
+tqdm>=4.66.0
+fake-useragent>=1.4.0
+
+# 浏览器自动化
+pydoll-python>=2.22.0
+
+# 图像处理（验证码破解）
+opencv-python>=4.8.0
+numpy>=1.24.0

@@ -30,9 +30,24 @@ braveDetailedNews/
 
 ### 安装依赖
 
+#### 方式1：使用虚拟环境（推荐）✅
+
 ```bash
-pip install pydoll-python
+# 1. 创建并激活虚拟环境
+python3 -m venv venv
+source venv/bin/activate
+
+# 2. 安装所有依赖（使用清华镜像）
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
+
+#### 方式2：系统环境安装
+
+```bash
+pip install pydoll-python scrapy twisted parsel langchain-openai langchain-core
+```
+
+**注意**：如果你的系统使用 PEP 668（Ubuntu 23.04+、Debian 12+），必须使用虚拟环境。详见 [VENV_GUIDE.md](VENV_GUIDE.md)
 
 ### 使用方法
 

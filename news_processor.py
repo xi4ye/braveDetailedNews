@@ -42,6 +42,8 @@ DEEPSEEK_CONFIG = {
     "api_key": os.environ.get("DEEPSEEK_API_KEY", "")
 }
 
+CURRENT_CONFIG = DEEPSEEK_CONFIG
+
 
 def extract_domain(url: str) -> str:
     """从URL中提取域名"""
@@ -1655,6 +1657,12 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
     print(f"处理新闻: {news_item['title'][:50]}...")
     print(f"来源: {news_item['author']}")
     print(f"原始域名: {original_domain}")
+    
+    if error_manager.is_blacklisted(original_domain):
+        print(f"[跳过] 域名 {original_domain} 在黑名单中（请求前检查）")
+        print(f"{'='*60}")
+        return False, {**news_item, 'content': '', '_id': news_id, 'status': 'blacklisted'}
+    
     print(f"正在获取页面: {url}")
 
     html_content, final_url, status_code = browser_manager.extractor.fetch_page(url)
@@ -1662,11 +1670,10 @@ def process_news_item(news_item: Dict[str, Any], agent: DeepSeekAgentWithTools, 
 
     if final_domain != original_domain:
         print(f"[重定向] {original_domain} -> {final_domain}")
-
-    if error_manager.is_blacklisted(final_domain):
-        print(f"[跳过] 域名 {final_domain} 在黑名单中")
-        print(f"{'='*60}")
-        return False, {**news_item, 'content': '', '_id': news_id, 'status': 'blacklisted'}
+        if error_manager.is_blacklisted(final_domain):
+            print(f"[跳过] 重定向域名 {final_domain} 在黑名单中")
+            print(f"{'='*60}")
+            return False, {**news_item, 'content': '', '_id': news_id, 'status': 'blacklisted'}
 
     if status_code >= 400:
         error_manager.add_error(final_domain, f"HTTP {status_code}")
@@ -2018,7 +2025,7 @@ def process_jsonl_file(jsonl_file: str, proxy: str = None):
     _browser_manager = BrowserManager()
     _browser_manager.start(proxy=proxy)
     
-    agent = DeepSeekAgentWithTools(DEEPSEEK_CONFIG, memory_manager)
+    agent = DeepSeekAgentWithTools(CURRENT_CONFIG, memory_manager)
     
     processed_count = 0
     success_count = 0
