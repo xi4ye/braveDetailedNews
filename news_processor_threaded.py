@@ -43,7 +43,7 @@ OUTPUT_JSONL_FILE = "results_threaded.jsonl"
 MAX_AGENT_STEPS = 20
 MEMORY_FILE = "memory.json"
 ERROR_FILE = "error_threaded.json"
-BLACKLIST_THRESHOLD = 10
+BLACKLIST_THRESHOLD = 3  # 降低黑名单阈值，更快地跳过问题域名
 PURE_SCRIPT_THRESHOLD = 1
 MAX_WORKERS = 5  # 线程数，可以根据实际情况调整
 STATS_FILE = "processor_stats.json"  # 统计信息保存文件
@@ -131,6 +131,13 @@ class ThreadLocalContext:
         self._local.page_cache = {}
         self._local.tool_call_history = []
         self._local.extraction_completed = False
+        
+        # 生成简洁的线程标识
+        thread_id = threading.current_thread().ident
+        # 使用线程ID的后4位作为简短标识
+        short_id = str(thread_id)[-4:]
+        title = news_info.get('title', 'Unknown')[:15]
+        self._local.thread_tag = f"[T{short_id}|{title}]"
     
     @property
     def browser_manager(self):
@@ -155,9 +162,37 @@ class ThreadLocalContext:
     @extraction_completed.setter
     def extraction_completed(self, value):
         self._local.extraction_completed = value
+    
+    @property
+    def thread_tag(self):
+        """获取线程标识标签"""
+        return getattr(self._local, 'thread_tag', '[Thread-?]')
 
 
 _thread_local = ThreadLocalContext()
+
+
+def log_print(message: str, level: str = "INFO"):
+    """带线程标识的日志输出
+    
+    Args:
+        message: 日志消息
+        level: 日志级别 (INFO, TOOL, SUCCESS, ERROR)
+    """
+    thread_tag = _thread_local.thread_tag
+    
+    # 根据级别添加前缀
+    if level == "TOOL":
+        prefix = "🔧 "
+    elif level == "SUCCESS":
+        prefix = "✅ "
+    elif level == "ERROR":
+        prefix = "❌ "
+    else:
+        prefix = "   "
+    
+    print(f"{thread_tag} {prefix}{message}")
+    sys.stdout.flush()
 
 
 class ThreadSafeMemoryManager:
@@ -431,7 +466,7 @@ def get_page_dom(url: str) -> str:
     current_news_info = _thread_local.current_news_info
     page_cache = _thread_local.page_cache
     
-    print(f"[Tool] 获取DOM: {url}")
+    log_print(f"获取DOM: {url}", level="TOOL")
     
     if check_extraction_completed():
         return json.dumps({"success": False, "error": "提取已完成，无需继续操作"}, ensure_ascii=False)
@@ -444,7 +479,7 @@ def get_page_dom(url: str) -> str:
     
     try:
         if url in page_cache:
-            print(f"  [缓存] 使用缓存的页面内容")
+            log_print(f"使用缓存的页面内容", level="INFO")
             html_content, final_url, status_code = page_cache[url]
         else:
             html_content, final_url, status_code = browser_manager.extractor.fetch_page(url)
@@ -464,7 +499,7 @@ def get_page_dom(url: str) -> str:
         
         final_domain = extract_domain(final_url)
         current_news_info['final_domain'] = final_domain
-        print(f"[Tool] 最终域名: {final_domain}")
+        log_print(f"最终域名: {final_domain}", level="INFO")
         
         if '<title>404' in html_content or 'class="error-404"' in html_content or 'id="error"' in html_content:
             return "错误：页面内容显示404错误"
@@ -529,7 +564,7 @@ def validate_locator(locator_type: str, locator_value: str) -> str:
     url = current_news_info.get('url', '')
     title = current_news_info.get('title', '')
     
-    print(f"[Tool] 验证定位器: {locator_type}={locator_value}")
+    log_print(f"验证定位器: {locator_type}={locator_value}", level="TOOL")
     
     generic_check = check_locator_is_generic(locator_value, title)
     if not generic_check["is_generic"]:
@@ -545,7 +580,7 @@ def validate_locator(locator_type: str, locator_value: str) -> str:
     
     try:
         if url in page_cache:
-            print(f"  [缓存] 使用缓存的页面内容")
+            log_print(f"使用缓存的页面内容", level="INFO")
             html_content, final_url, status_code = page_cache[url]
         else:
             html_content, final_url, status_code = browser_manager.extractor.fetch_page(url)
@@ -596,14 +631,14 @@ def extract_content(locator_type: str, locator_value: str) -> str:
     
     url = current_news_info.get('url', '')
     
-    print(f"[Tool] 提取正文: {locator_type}={locator_value}")
+    log_print(f"提取正文: {locator_type}={locator_value}", level="TOOL")
     
     if browser_manager is None or browser_manager.extractor is None:
         return "错误：Scrapy 提取器未初始化"
     
     try:
         if url in page_cache:
-            print(f"  [缓存] 使用缓存的页面内容")
+            log_print(f"使用缓存的页面内容", level="INFO")
             html_content, final_url, status_code = page_cache[url]
         else:
             html_content, final_url, status_code = browser_manager.extractor.fetch_page(url)
@@ -634,6 +669,157 @@ def extract_content(locator_type: str, locator_value: str) -> str:
 
 
 @tool
+def validate_date_locator(locator_type: str, locator_value: str) -> str:
+    """验证日期定位器是否能正确找到日期元素
+
+    Args:
+        locator_type: 定位类型，可选值：css_selector, xpath, id, class
+        locator_value: 具体的定位值（CSS选择器、XPath表达式、ID或class名）
+
+    Returns:
+        验证结果JSON字符串，包含是否成功、提取的内容片段、是否为通用型等信息
+    """
+    browser_manager = _thread_local.browser_manager
+    current_news_info = _thread_local.current_news_info
+    page_cache = _thread_local.page_cache
+    
+    url = current_news_info.get('url', '')
+    title = current_news_info.get('title', '')
+    
+    log_print(f"[Tool] 验证日期定位器: {locator_type}={locator_value}")
+    
+    generic_check = check_locator_is_generic(locator_value, title)
+    if not generic_check["is_generic"]:
+        return json.dumps({
+            "success": False,
+            "error": "定位表达式不是通用型",
+            "issues": generic_check["issues"],
+            "hint": "请生成通用的日期定位表达式，不要包含文章标题、日期、人名等特定内容。"
+        }, ensure_ascii=False)
+    
+    if browser_manager is None or browser_manager.extractor is None:
+        return json.dumps({"success": False, "error": "Scrapy 提取器未初始化"}, ensure_ascii=False)
+    
+    try:
+        if url in page_cache:
+            log_print(f"[日期验证缓存] 使用缓存的页面内容")
+            html_content, final_url, status_code = page_cache[url]
+        else:
+            html_content, final_url, status_code = browser_manager.extractor.fetch_page(url)
+            page_cache[url] = (html_content, final_url, status_code)
+        
+        if status_code >= 400:
+            return json.dumps({"success": False, "error": f"页面加载失败（HTTP {status_code}）"}, ensure_ascii=False)
+        
+        if not html_content:
+            return json.dumps({"success": False, "error": "页面内容为空"}, ensure_ascii=False)
+        
+        if '<title>404' in html_content or 'class="error-404"' in html_content or 'id="error"' in html_content:
+            return json.dumps({"success": False, "error": "页面内容显示404错误"}, ensure_ascii=False)
+        
+        content = browser_manager.extractor.extract_text_by_selector(
+            html_content, locator_type, locator_value
+        )
+        
+        if not content or not content.strip():
+            return json.dumps({"success": False, "error": "未找到日期元素，请尝试其他定位方式"}, ensure_ascii=False)
+        
+        date_patterns = [
+            r'\d{4}-\d{2}-\d{2}',
+            r'\d{4}年\d{1,2}月\d{1,2}日',
+            r'[A-Za-z]+\s+\d{1,2},?\s*\d{4}',
+            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}'
+        ]
+        
+        has_date = any(re.search(pattern, content) for pattern in date_patterns)
+        
+        return json.dumps({
+            "success": True,
+            "date_found": has_date,
+            "content_preview": content[:500] if content else "",
+            "is_generic": True,
+            "message": "日期定位验证成功，表达式为通用型"
+        }, ensure_ascii=False)
+        
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"验证过程异常: {str(e)}"}, ensure_ascii=False)
+
+
+@tool
+def extract_date(locator_type: str, locator_value: str) -> str:
+    """使用定位器提取网页中的日期信息
+
+    Args:
+        locator_type: 定位类型，可选值：css_selector, xpath, id, class
+        locator_value: 具体的定位值
+
+    Returns:
+        提取的日期文本，如果失败返回错误信息
+    """
+    browser_manager = _thread_local.browser_manager
+    current_news_info = _thread_local.current_news_info
+    page_cache = _thread_local.page_cache
+    
+    url = current_news_info.get('url', '')
+    
+    log_print(f"[Tool] 提取日期: {locator_type}={locator_value}")
+    
+    if browser_manager is None or browser_manager.extractor is None:
+        return "错误：Scrapy 提取器未初始化"
+    
+    try:
+        if url in page_cache:
+            log_print(f"[日期缓存] 使用缓存的页面内容")
+            html_content, final_url, status_code = page_cache[url]
+        else:
+            html_content, final_url, status_code = browser_manager.extractor.fetch_page(url)
+            page_cache[url] = (html_content, final_url, status_code)
+        
+        if status_code >= 400:
+            log_print(f"[日期失败] 页面加载失败（HTTP {status_code}）")
+            return f"错误：页面加载失败（HTTP {status_code}）"
+        
+        if not html_content:
+            log_print(f"[日期失败] 页面内容为空")
+            return "错误：页面内容为空"
+        
+        if '<title>404' in html_content or 'class="error-404"' in html_content or 'id="error"' in html_content:
+            log_print(f"[日期失败] 页面返回404错误")
+            return "错误：页面内容显示404错误"
+        
+        log_print(f"[日期提取] 使用 {locator_type}={locator_value} 提取日期")
+        date_text = browser_manager.extractor.extract_text_by_selector(
+            html_content, locator_type, locator_value
+        )
+        
+        if not date_text:
+            log_print(f"[日期失败] 未找到日期元素")
+            return "错误：未找到日期元素"
+        
+        date_text = re.sub(r'\s+', ' ', date_text).strip()
+        
+        date_patterns = [
+            r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+            r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
+            r'(\d{4}-\d{2}-\d{2})',
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, date_text)
+            if match:
+                date_text = match.group(1)
+                break
+        
+        print(f"  [日期成功] 提取到日期文本: {date_text}")
+        
+        return date_text
+        
+    except Exception as e:
+        print(f"  [日期异常] 提取日期异常: {str(e)}")
+        return f"错误：提取日期异常 - {str(e)}"
+
+
+@tool
 def get_existing_locator(domain: str) -> str:
     """查询已有定位规则"""
     return json.dumps({
@@ -643,17 +829,59 @@ def get_existing_locator(domain: str) -> str:
 
 
 @tool
-def save_locator(locator_type: str, locator_value: str, locator_desc: str) -> str:
-    """保存定位规则"""
+def save_locator(locator_type: str, locator_value: str, locator_desc: str, locator_category: str = "content") -> str:
+    """保存验证通过的通用型定位规则到记忆库
+
+    Args:
+        locator_type: 定位类型
+        locator_value: 定位值（必须是通用型表达式）
+        locator_desc: 定位方式描述
+        locator_category: 定位器类别，'content' 或 'date'
+
+    Returns:
+        保存结果
+    """
+    current_news_info = _thread_local.current_news_info
+    
+    domain = current_news_info.get('final_domain', current_news_info.get('domain', ''))
+    
+    locator_json = {
+        "domain": domain,
+        "locator_type": locator_type,
+        "locator_value": locator_value,
+        "locator_desc": locator_desc,
+        "locator_category": locator_category,
+        "create_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "is_valid": True,
+        "usage_count": 0,
+        "success_count": 0
+    }
+    
+    if locator_category == 'date':
+        current_news_info['_saved_date_locator'] = locator_json
+    else:
+        current_news_info['_saved_locator'] = locator_json
+    
     return json.dumps({
-        "success": True, 
-        "message": "定位规则已保存",
-        "locator": {
-            "locator_type": locator_type,
-            "locator_value": locator_value,
-            "locator_desc": locator_desc
-        }
+        "success": True,
+        "message": f"通用型定位规则已保存，域名: {domain}，类别: {locator_category}",
+        "locator": locator_json
     }, ensure_ascii=False)
+
+
+@tool
+def save_date_locator(locator_type: str, locator_value: str, locator_desc: str) -> str:
+    """保存验证通过的日期定位规则到记忆库
+
+    Args:
+        locator_type: 定位类型
+        locator_value: 定位值（必须是通用型表达式）
+        locator_desc: 定位方式描述
+
+    Returns:
+        保存结果
+    """
+    return save_locator(locator_type, locator_value, locator_desc, locator_category="date")
 
 
 @tool
@@ -677,7 +905,7 @@ class DeepSeekAgentWithTools:
             api_key=config["api_key"],
             temperature=0
         )
-        self.tools = [get_page_dom, validate_locator, extract_content, get_existing_locator, save_locator, give_up]
+        self.tools = [get_page_dom, validate_locator, validate_date_locator, extract_content, extract_date, get_existing_locator, save_locator, save_date_locator, give_up]
         self.llm_with_tools = self.llm.bind_tools(self.tools)
     
     def process_news(self, news_item: Dict[str, Any]) -> Dict[str, Any]:
@@ -688,7 +916,9 @@ class DeepSeekAgentWithTools:
         elif not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
-        system_prompt = f"""你是一个专业的网页正文定位专家。你的任务是找到网页中新闻正文的位置并提取内容。
+        system_prompt = f"""你是一个专业的网页正文定位专家。你的任务有两项：
+1. 找到网页中新闻正文的位置并提取正文内容
+2. 找到网页中发布日期的位置并提取日期表达式
 
 【核心要求】生成的定位表达式必须是【通用型】：
 - 同一域名下的所有文章都能使用该表达式
@@ -702,38 +932,90 @@ class DeepSeekAgentWithTools:
 - <noscript> 标签：包含备用内容，不是正文
 - <svg> 标签：包含图标/图形，不是正文
 
-【正确示例】：
+【正文定位正确示例】：
 - css_selector: "div.article-content", "#js_content", ".rich_media_content", "div.content article"
 - xpath: "//article//div[@class='content']", "//div[contains(@class, 'article-body')]", "//div[@class='main']//p[not(ancestor::script or ancestor::style)]"
 - id: "artibody", "js_content", "article-content"
 
-【错误示例】（禁止使用）：
+【正文定位错误示例】（禁止使用）：
 - "//*[text()]" - 会匹配所有文本，包括 script/style 内的代码！
+- "//p[contains(text(), '摩尔线程')]" - 包含文章特定内容
+- "//div[contains(., '9月26日')]" - 包含日期
+- "//*[contains(text(), '公司仅用88天')]" - 包含文章特定内容
+
+【日期定位要求】：
+- 日期通常位于文章标题下方、作者信息附近、或网页头部 meta 标签中
+- 常见位置：class="date"、class="time"、class="publish-time"、id="pubdate" 等
+- 定位器应能匹配该域名下所有文章的日期元素
+
+【日期格式返回要求】：
+- 如果找到完整日期时间，返回标准格式: YYYY-MM-DD hh:mm:ss
+- 如果只有日期部分 (YYYY-MM-DD)，请只返回该部分
+- 如果无法找到日期，返回空字符串
 
 当前新闻信息：
 - 标题: {news_item['title']}
 - 来源: {news_item['author']}
 - URL: {news_item['url']}
 
-【绝对关键提示】：
-1. extract_content 成功后必须立即调用 save_locator，然后立即返回最终结果
-2. 不要继续尝试其他定位器，哪怕有更多可能的选项
-3. 不要重复调用 get_page_dom，第一次获取后就不要再获取
-4. 一旦有一个定位器验证成功且提取成功，立即结束整个流程！
+你可以使用以下工具：
+1. get_page_dom(url) - 获取网页DOM结构（会返回最终跳转后的域名）
+2. get_existing_locator(domain) - 查询该域名是否已有定位规则（返回 content 和 date 两类）
+3. validate_locator(locator_type, locator_value) - 验证定位器是否有效（会检查是否为通用型）
+4. extract_content(locator_type, locator_value) - 提取正文内容
+5. extract_date(locator_type, locator_value) - 提取日期文本
+6. save_locator(locator_type, locator_value, locator_desc) - 保存正文定位规则
+7. save_date_locator(locator_type, locator_value, locator_desc) - 保存日期定位规则
+8. give_up(reason) - 放弃处理当前新闻
 
-请开始工作，严格按照上述流程调用工具。成功提取正文后，返回最终结果。"""
+【重要】遇到以下情况请立即调用 give_up 工具终止处理：
+- 页面返回404错误
+- 页面内容已被删除或失效
+- 多次尝试都无法成功（不要浪费token继续尝试）
+
+【高效工作流程（必须严格遵循）】：
+1. get_page_dom(url) - 获取网页DOM结构，获取最终域名 final_domain
+2. 如果页面返回404或无法访问，立即调用 give_up 放弃
+3. get_existing_locator(final_domain) - 查询该域名是否已有定位规则
+4. 如果已有 content 规则：
+   - 直接 extract_content 提取正文
+   - 成功后继续尝试提取日期
+5. 如果已有 date 规则：
+   - 直接 extract_date 提取日期
+6. 如果没有规则：
+   - 分析DOM，选择最可能的正文定位器，validate_locator 验证
+   - 验证成功后 extract_content 提取正文
+   - 分析DOM，选择最可能的日期定位器，validate_locator 验证
+   - 验证成功后 extract_date 提取日期
+7. 提取成功后分别调用 save_locator 和 save_date_locator 保存
+8. 【关键】不要尝试多个定位器，找到一个能用的就停止！
+
+【绝对关键提示】：
+1. 提取正文和日期是独立任务，可以并行思考但需要分别保存
+2. extract_content 成功后必须立即调用 save_locator
+3. extract_date 成功后必须立即调用 save_date_locator
+4. 不要继续尝试其他定位器，找到一个能用的就停止
+5. 不要重复调用 get_page_dom，第一次获取后就不要再获取
+6. 两个任务都完成后返回最终结果
+
+请开始工作，严格按照上述流程调用工具。"""
         
         messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(content="请开始处理这条新闻，找到正文并提取。记住：定位表达式必须是通用型，找到一个能用的就停止！")
+            HumanMessage(content="请开始处理这条新闻，找到正文并提取，同时找到并提取发布日期。记住：定位表达式必须是通用型，不能包含文章特定内容！")
         ]
         
         final_content = None
-        final_locator = None
-        last_validated_locator = None
+        final_date_text = None
+        final_content_locator = None
+        final_date_locator = None
+        last_validated_content_locator = None
+        last_validated_date_locator = None
+        date_extraction_completed = False
+        content_extraction_completed = False
         
         for step in range(MAX_AGENT_STEPS):
-            print(f"\n[Agent Step {step + 1}/{MAX_AGENT_STEPS}]")
+            log_print(f"Step {step + 1}/{MAX_AGENT_STEPS}", level="INFO")
             
             try:
                 # API限流：在调用API前获取许可
@@ -747,7 +1029,7 @@ class DeepSeekAgentWithTools:
                         tool_name = tool_call["name"]
                         tool_args = tool_call["args"]
                         
-                        print(f"  → 调用工具: {tool_name}({tool_args})")
+                        log_print(f"→ {tool_name}({tool_args})", level="TOOL")
                         
                         tool_func = None
                         for t in self.tools:
@@ -757,7 +1039,7 @@ class DeepSeekAgentWithTools:
                         
                         if tool_func:
                             if check_extraction_completed():
-                                print(f"  [拦截] 提取已完成，跳过工具调用: {tool_name}")
+                                log_print(f"拦截: 提取已完成", level="INFO")
                                 tool_result = json.dumps({"success": False, "error": "提取已完成，无需继续操作"}, ensure_ascii=False)
                             elif check_duplicate_tool_call(tool_name, tool_args):
                                 tool_result = json.dumps({"success": False, "error": "重复调用，已跳过"}, ensure_ascii=False)
@@ -765,7 +1047,8 @@ class DeepSeekAgentWithTools:
                                 record_tool_call(tool_name, tool_args)
                                 try:
                                     tool_result = tool_func.invoke(tool_args)
-                                    print(f"  ← 工具结果: {tool_result[:200] if len(str(tool_result)) > 200 else tool_result}")
+                                    result_preview = tool_result[:100] if len(str(tool_result)) > 100 else tool_result
+                                    log_print(f"← {result_preview}", level="INFO")
                                 except Exception as e:
                                     tool_result = f"工具执行错误: {str(e)}"
                             
@@ -777,7 +1060,7 @@ class DeepSeekAgentWithTools:
                             if tool_name == "give_up":
                                 try:
                                     result = json.loads(tool_result)
-                                    print(f"\n[放弃] Agent主动放弃处理，原因: {result.get('reason', '未知')}")
+                                    log_print(f"放弃处理: {result.get('reason', '未知')}", level="ERROR")
                                     return {
                                         "success": False,
                                         "content": "",
@@ -800,53 +1083,111 @@ class DeepSeekAgentWithTools:
                                 try:
                                     result = json.loads(tool_result)
                                     if result.get("success"):
-                                        last_validated_locator = {
-                                            "locator_type": tool_args.get("locator_type"),
-                                            "locator_value": tool_args.get("locator_value")
-                                        }
+                                        locator_type = tool_args.get("locator_type")
+                                        locator_value = tool_args.get("locator_value")
+                                        if content_extraction_completed:
+                                            last_validated_date_locator = {
+                                                "locator_type": locator_type,
+                                                "locator_value": locator_value
+                                            }
+                                        else:
+                                            last_validated_content_locator = {
+                                                "locator_type": locator_type,
+                                                "locator_value": locator_value
+                                            }
                                 except:
                                     pass
                             
                             if tool_name == "extract_content":
                                 if not str(tool_result).startswith("错误"):
                                     final_content = tool_result
-                                    mark_extraction_completed()
+                                    content_extraction_completed = True
+                                    log_print(f"正文提取成功 - 长度: {len(final_content)} 字符", level="SUCCESS")
                                     
-                                    if last_validated_locator:
-                                        print(f"\n[优化] 检测到已有验证通过的定位器，直接保存并结束")
+                                    if last_validated_content_locator:
+                                        log_print(f"检测到已验证的正文定位器", level="INFO")
                                         domain = _thread_local.current_news_info.get('final_domain', _thread_local.current_news_info.get('domain', ''))
-                                        final_locator = {
-                                            **last_validated_locator,
+                                        final_content_locator = {
+                                            **last_validated_content_locator,
                                             "domain": domain,
+                                            "locator_category": "content",
                                             "locator_desc": "自动保存",
                                             "create_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                             "is_valid": True,
                                             "usage_count": 0,
                                             "success_count": 0
                                         }
-                                        return {
-                                            "success": True,
-                                            "content": final_content,
-                                            "locator": final_locator
+                            
+                            if tool_name == "extract_date":
+                                if not str(tool_result).startswith("错误") and tool_result.strip():
+                                    final_date_text = tool_result
+                                    date_extraction_completed = True
+                                    print(f"\n[日期提取成功] 日期文本: {final_date_text}")
+                                    
+                                    if last_validated_date_locator:
+                                        print(f"[检测到已验证的日期定位器]")
+                                        domain = _thread_local.current_news_info.get('final_domain', _thread_local.current_news_info.get('domain', ''))
+                                        final_date_locator = {
+                                            **last_validated_date_locator,
+                                            "domain": domain,
+                                            "locator_category": "date",
+                                            "locator_desc": "自动保存",
+                                            "create_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                            "is_valid": True,
+                                            "usage_count": 0,
+                                            "success_count": 0
                                         }
+                            
+                            if tool_name == "save_locator":
+                                try:
+                                    result = json.loads(tool_result)
+                                    if result.get("success"):
+                                        locator = result.get("locator", {})
+                                        if locator.get("locator_category") == "date":
+                                            final_date_locator = locator
+                                        else:
+                                            final_content_locator = locator
+                                except:
+                                    pass
+                            
+                            if tool_name == "save_date_locator":
+                                try:
+                                    result = json.loads(tool_result)
+                                    if result.get("success"):
+                                        final_date_locator = result.get("locator")
+                                        date_extraction_completed = True
+                                except:
+                                    pass
+                            
+                            if content_extraction_completed and date_extraction_completed:
+                                print(f"\n[完成] 正文和日期都已提取完成，准备返回结果")
+                                return {
+                                    "success": True,
+                                    "content": final_content or "",
+                                    "date_text": final_date_text,
+                                    "content_locator": final_content_locator,
+                                    "date_locator": final_date_locator
+                                }
                 
                 else:
                     content = response.content
                     
                     completion_keywords = [
                         "success", "完成", "成功", "已经完成", "提取成功",
-                        "正文已提取", "任务完成", "finished", "done"
+                        "正文已提取", "日期已提取", "任务完成", "finished", "done"
                     ]
                     
                     has_completion = any(keyword in content.lower() or keyword in content for keyword in completion_keywords)
                     
-                    if has_completion or final_content:
-                        if final_content:
+                    if has_completion or (final_content and final_date_text):
+                        if final_content and final_date_text:
                             print(f"\n[检测到完成信号] 直接返回结果")
                             return {
                                 "success": True,
-                                "content": final_content,
-                                "locator": final_locator
+                                "content": final_content or "",
+                                "date_text": final_date_text,
+                                "content_locator": final_content_locator,
+                                "date_locator": final_date_locator
                             }
                     
                     if step >= MAX_AGENT_STEPS - 1:
@@ -863,7 +1204,9 @@ class DeepSeekAgentWithTools:
         return {
             "success": False,
             "content": final_content or "",
-            "locator": final_locator,
+            "date_text": final_date_text,
+            "content_locator": final_content_locator,
+            "date_locator": final_date_locator,
             "error": "达到最大步骤限制"
         }
 
@@ -1037,8 +1380,8 @@ class NewsSpider(scrapy.Spider):
         'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'ROBOTSTXT_OBEY': False,
         'RETRY_ENABLED': True,
-        'RETRY_TIMES': 3,
-        'DOWNLOAD_TIMEOUT': 30,
+        'RETRY_TIMES': 1,  # 减少重试次数，避免长时间等待
+        'DOWNLOAD_TIMEOUT': 15,  # 降低超时时间，加快失败速度
     }
     
     def __init__(self, news_list=None, memory_manager=None, error_manager=None, *args, **kwargs):
@@ -1176,8 +1519,8 @@ class NewsSpider(scrapy.Spider):
                 self.results.append(result_item)
                 self.stats['processed_count'] += 1
             
-            # 返回空列表，而不是 None
-            twisted_defer.returnValue([])
+            # 使用标准 return 语句，而不是 returnValue
+            return []
         
         return process_async()
     
@@ -1195,9 +1538,32 @@ class NewsSpider(scrapy.Spider):
     
     def errback(self, failure):
         news_item = failure.request.meta['news_item']
+        url = failure.request.url
+        
+        # 提取域名
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc
+        
+        # 记录错误到黑名单
+        error_reason = str(failure.value)
+        if 'timeout' in error_reason.lower() or 'timed out' in error_reason.lower():
+            error_reason = "请求超时"
+        elif 'connection' in error_reason.lower():
+            error_reason = "连接失败"
+        else:
+            error_reason = f"爬取失败: {error_reason[:50]}"
+        
+        self.error_manager.add_error(domain, error_reason)
+        
         print(f"\n{'='*60}")
-        print(f"[错误] 爬取失败: {failure.request.url}")
-        print(f"错误原因: {str(failure)}")
+        print(f"[错误] 爬取失败: {url}")
+        print(f"域名: {domain}")
+        print(f"错误原因: {error_reason}")
+        
+        # 检查是否已加入黑名单
+        if self.error_manager.is_blacklisted(domain):
+            print(f"[黑名单] 域名 {domain} 已加入黑名单")
+        
         sys.stdout.flush()
         
         news_id = re.sub(r'[^\w\-]', '_', f"{news_item.get('author', 'unknown')}_{news_item.get('title', 'unknown')[:20]}")
@@ -1205,6 +1571,8 @@ class NewsSpider(scrapy.Spider):
         result_item['content'] = ''
         result_item['_id'] = news_id
         result_item['used_agent'] = False
+        result_item['status'] = 'crawl_error'
+        result_item['error_reason'] = error_reason
         self.results.append(result_item)
         self.stats['processed_count'] += 1
 
@@ -1386,8 +1754,8 @@ def process_jsonl_file_scrapy(jsonl_file: str, concurrent_requests: int = 5):
     settings.set('USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
     settings.set('ROBOTSTXT_OBEY', False)
     settings.set('RETRY_ENABLED', True)
-    settings.set('RETRY_TIMES', 3)
-    settings.set('DOWNLOAD_TIMEOUT', 30)
+    settings.set('RETRY_TIMES', 1)  # 减少重试次数
+    settings.set('DOWNLOAD_TIMEOUT', 15)  # 降低超时时间
     settings.set('LOG_LEVEL', 'INFO')
     
     runner = CrawlerRunner(settings)
@@ -1473,6 +1841,10 @@ if __name__ == "__main__":
     print("开始Scrapy异步爬取处理...")
     
     from twisted.internet import reactor
+    
+    # 配置线程池大小
+    reactor.suggestThreadPoolSize(MAX_WORKERS)
+    print(f"线程池大小: {MAX_WORKERS}")
     
     def run_processing():
         """启动处理流程"""

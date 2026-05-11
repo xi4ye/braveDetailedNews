@@ -375,7 +375,7 @@ async def crawl_news(news,K=20, proxy=None):
         print(result)
         return result
 if __name__ == "__main__":
-    news = "White House press conference hit by shooting"
+    news = "莫迪及其盟友在孟买民意调查中大获全胜，旨在进行基础设施改革"
     K = 5
     # query_date = "2025-07-30"
     asyncio.run(crawl_news(news, K))

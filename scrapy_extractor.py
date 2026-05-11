@@ -297,15 +297,13 @@ class ScrapyExtractor:
 
 
 class ScrapyManager:
-    """Scrapy 管理器 - 替代 BrowserManager"""
+    """Scrapy 管理器 - 替代 BrowserManager
     
-    _instance = None
-    _extractor = None
+    注意：不使用单例模式，每个线程创建自己的实例
+    """
     
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    def __init__(self):
+        self._extractor = None
     
     def start(self, proxy: str = None):
         """启动提取器"""
